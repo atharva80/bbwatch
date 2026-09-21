@@ -231,6 +231,14 @@ def main():
     topic = os.environ.get("NTFY_TOPIC")
     if not topic:
         sys.exit("NTFY_TOPIC is required")
+    if os.environ.get("BBWATCH_TEST", "").lower() in ("1", "true", "yes"):
+        publish(
+            topic,
+            "🔔 bbwatch test (medium)",
+            "This came from GitHub Actions -> ntfy.\nPriority 3 = medium: normal notification, no buzz under DND.\nIf you can read this, the whole pipeline works.",
+            3,
+        )
+        return
     hc = os.environ.get("HEALTHCHECK_URL")
 
     new_sha, committed_at = latest_commit(token)

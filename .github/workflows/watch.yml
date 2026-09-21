@@ -11,7 +11,12 @@ name: bbwatch
 on:
   schedule:
     - cron: "*/10 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send a test notification instead of watching"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -34,6 +39,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+          BBWATCH_TEST: ${{ inputs.test }}
         run: python3 watch.py
 
       - name: Commit state
