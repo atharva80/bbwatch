@@ -1,0 +1,17 @@
+name: probe
+
+# Schedule diagnostics: does GitHub's scheduler fire AT ALL on this repo?
+# Trivial 5-minute job, no state, no secrets. If this fires and bbwatch
+# doesn't, the bug is workflow-specific; if neither fires, it's the
+# scheduler warming up the repo.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "probe ok $(date -u +%FT%TZ)"
