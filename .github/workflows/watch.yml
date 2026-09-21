@@ -1,0 +1,47 @@
+name: bbwatch
+
+# 24/7 public bug-bounty watcher. Runs in GitHub's cloud — nothing on the
+# user's machine needs to be on. Every ~10 minutes it polls
+# arkadiyt/bounty-targets-data (which itself refreshes every ~30 min),
+# diffs structured data, and pushes events to ntfy.
+#
+# The state.json commit at the end is also what keeps GitHub from
+# disabling this schedule after 60 days of repository inactivity.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bbwatch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Poll and notify
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+        run: python3 watch.py
+
+      - name: Commit state
+        run: |
+          git config user.name "bbwatch-bot"
+          git config user.email "bbwatch-bot@users.noreply.github.com"
+          git add state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "state: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
