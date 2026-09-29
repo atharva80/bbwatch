@@ -119,6 +119,12 @@ def _at(lst, i):
     return lst[i] if isinstance(i, int) and 0 <= i < len(lst) else str(i)
 
 
+def money(v, cur="USD"):
+    sym = {"USD": "$", "EUR": "€", "GBP": "£"}.get(str(cur or "").upper())
+    v = int(v) if float(v).is_integer() else v
+    return f"{sym}{v:,}" if sym else f"{v:,} {cur}".strip()
+
+
 def _num(v):
     try:
         return float(re.sub(r"[^\d.]", "", str(v)) or 0)
@@ -408,7 +414,7 @@ class Intigriti(Source):
             out[h["programId"]] = program(
                 h.get("name"), f"https://www.intigriti.com/programs/{q(ch)}/{q(hd)}/detail",
                 _at(self.STATUS, h.get("status")), val > 0,
-                f"{val:,} {mx.get('currency') or ''}".strip() if val else None,
+                money(val, mx.get("currency")) if val else None,
                 sig=h.get("lastUpdatedAt"), tags=tags, ref=[ch, hd])
         return out
 
@@ -447,7 +453,8 @@ class YesWeHack(Source):
             mx = r.get("bounty_reward_max") or 0
             out[r["slug"]] = program(
                 r.get("title"), f"https://yeswehack.com/programs/{r['slug']}", state, r.get("bounty"),
-                f"{mx:,}" if mx else None, sig=f"{r.get('last_update_at')}|{r.get('scopes_count')}",
+                money(mx, r.get("currency") or "EUR") if mx else None,
+                sig=f"{r.get('last_update_at')}|{r.get('scopes_count')}",
                 tags=["VDP"] if r.get("vdp") else None)
         return out
 
@@ -489,7 +496,7 @@ class Immunefi(Source):
             tags = [t for t, on in (("invite-only", b.get("inviteOnly")), ("KYC", b.get("kyc")),
                                     ("boost", b.get("endDate"))) if on]
             out[slug] = program(b.get("project") or slug, f"https://immunefi.com/bug-bounty/{slug}/", state,
-                                mx > 0, f"${mx:,}" if mx else None, sig=b.get("updatedDate"), assets=assets,
+                                mx > 0, money(mx) if mx else None, sig=b.get("updatedDate"), assets=assets,
                                 tags=tags)
         book["etag"] = h.get("ETag")
         return out
@@ -562,57 +569,107 @@ def reconcile(state, mirror, by_name):
 SOURCES = {s.name: s for s in (HackerOne, Bugcrowd, Intigriti, YesWeHack, Immunefi, Mirror)}
 
 
-# ---------- diffing ----------
+# ---------- messages ----------
+#
+# Phone-first: the title says who and what; the first body lines are the change itself
+# (what shows in a collapsed notification); the program summary comes last.
+#
+#   🔭 1win · H1 — 2 new targets
+#   ➕ 1w.cash — Web · bounty · critical
+#   ➕ Deposit/Withdraw — Other · bounty · critical
+#   ➖ old.1win.com — removed from scope
+#
+#   Open · pays bounties
 
-TITLES = {
-    "NEW": "🆕 New program", "SCOPE": "🔭 Scope added", "BOUNTY": "💰 Bounty change", "OPEN": "🟢 Reopened",
-    "STATE": "🚦 Status change", "SCOPE-": "✂️ Scope reduced", "GONE": "⚠️ Removed",
+LIVE = {"open", "active", "live", "upcoming"}  # states where a hunter can (soon) submit
+
+TYPE_NAMES = {
+    "Web": ("url", "website", "web-application", "websites_and_applications", "web", "application"),
+    "Wildcard": ("wildcard",),
+    "API": ("api",),
+    "Android app": ("android", "google_play_app_id", "mobile-application-android", "other_apk"),
+    "iOS app": ("ios", "apple_store_app_id", "mobile-application-ios", "testflight", "other_ipa"),
+    "Mobile app": ("mobile-application", "mobile"),
+    "Desktop app": ("downloadable_executables", "windows_app_store_app_id", "executable", "desktop"),
+    "Source code": ("source_code", "github", "repository", "repo"),
+    "Smart contract": ("smart_contract", "smart-contract", "contract"),
+    "Blockchain": ("blockchain_dlt", "blockchain", "protocol"),
+    "IP": ("ip_address", "ip"),
+    "IP range": ("cidr", "iprange", "ip_range"),
+    "Network": ("network",),
+    "Hardware/IoT": ("hardware", "iot", "device"),
+    "AI model": ("ai_model", "ai-model"),
 }
+TYPE_NAME = {raw: nice for nice, raws in TYPE_NAMES.items() for raw in raws}
+STATE_NAMES = {"open": "Open", "paused": "Paused", "closed": "Closed", "ended": "Ended", "suspended": "Suspended",
+               "closing": "Closing", "archived": "Archived", "upcoming": "Upcoming", "active": "Live",
+               "live": "Live", "judging": "Judging"}
+STATE_MEANING = {"open": "accepting reports again", "active": "live now", "live": "live now",
+                 "paused": "not accepting reports", "suspended": "not accepting reports",
+                 "closed": "closed", "ended": "ended", "judging": "submissions closed, judging",
+                 "upcoming": "starting soon"}
 
 
 def paid(a, p):
     return a[1] is True or (a[1] is None and p["bounty"])
 
 
-def show(k, a):
+def nice_state(s):
+    return STATE_NAMES.get(s, str(s).replace("_", " ").capitalize())
+
+
+def asset_line(mark, k, a, p, note=""):
     typ, ident = k.split("|", 1)
-    return f"{ident} ({', '.join([typ] + (['$'] if a[1] else []) + ([a[2]] if a[2] else []))})"
+    ident = " ".join(ident.split())
+    if len(ident) > 64:
+        ident = ident[:63] + "…"
+    bits = [TYPE_NAME.get(typ, "Other" if typ.isdigit() else typ.replace("_", " ").capitalize())]
+    if p["bounty"]:
+        bits.append("bounty" if paid(a, p) else "no bounty")
+    if a[2] and str(a[2]).lower() not in ("none", "null"):
+        bits.append(str(a[2]).lower().replace("_", " "))
+    return f"{mark} {ident} — {note or ' · '.join(bits)}"
 
 
-def event(src, key, p, kind, prio, lines, title=None):
-    head = ["bounty" if p["bounty"] else "no bounty"]
-    if p.get("max"):
-        head.append(f"max {p['max']}")
-    head.append(p["state"])
-    head += p.get("tags") or []
+def summary(p):
+    bits = [nice_state(p["state"])]
+    if p["bounty"]:
+        bits.append(f"pays up to {p['max']}" if p.get("max") else "pays bounties")
+    else:
+        bits.append("no bounty (VDP)")
+    bits += p.get("tags") or []
+    return " · ".join(bits)
+
+
+def event(src, p, kind, prio, what, lines, emoji):
     if len(lines) > MAX_LINES:
-        lines = lines[:MAX_LINES] + [f"… +{len(lines) - MAX_LINES} more"]
+        lines = lines[:MAX_LINES - 1] + [f"… and {len(lines) - MAX_LINES + 1} more"]
     return {"kind": kind, "prio": prio, "url": p.get("url"), "tag": src.name,
-            "title": title or f"{TITLES[kind]}: {p['name']} ({src.label})",
-            "body": "\n".join([" · ".join(head)] + lines)}
+            "title": f"{emoji} {p['name']} · {src.label} — {what}",
+            "body": "\n".join(lines + ["", summary(p)])}
+
+
+def plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
 
 
 def new_event(src, key, p):
-    prio = (5 if p["bounty"] else 3) if p["state"] == "open" else 2
+    live = p["state"] in LIVE
+    prio = (5 if p["bounty"] else 3) if live else 2
     a = p.get("assets")
     if a is None:
-        return event(src, key, p, "NEW", prio, ["scope not fetched yet"])
-    ins = sorted((k for k in a if a[k][0]), key=lambda k: (not paid(a[k], p), k))
-    return event(src, key, p, "NEW", prio, [f"{len(ins)} in-scope assets"] + [f"+ {show(k, a[k])}" for k in ins])
+        lines = ["Scope not published yet — open the program page."]
+    else:
+        ins = sorted((k for k in a if a[k][0]), key=lambda k: (not paid(a[k], p), k))
+        lines = [f"{plural(len(ins), 'target')} in scope:"] + [asset_line("•", k, a[k], p) for k in ins]
+    return event(src, p, "NEW", prio, f"new {'contest' if p.get('contest') else 'program'}", lines, "🆕")
 
 
 def diff_program(src, key, o, p):
-    kinds, lines, title = [], [], None
-    if o["state"] != p["state"]:
-        kinds.append(((4 if p["bounty"] else 3), "OPEN") if p["state"] == "open" else (2, "STATE"))
-        lines.append(f"status: {o['state']} → {p['state']}")
-    if o["bounty"] != p["bounty"]:
-        kinds.append((4 if p["bounty"] else 2, "BOUNTY"))
-        lines.append("now pays bounties" if p["bounty"] else "no longer pays bounties")
-    elif o.get("max") and p.get("max") and o["max"] != p["max"]:
-        kinds.append((4 if _num(p["max"]) > _num(o["max"]) else 2, "BOUNTY"))
-        lines.append(f"max bounty: {o['max']} → {p['max']}")
+    kinds, lines = [], []
+    live = p["state"] in LIVE
     oa, pa = o.get("assets"), p.get("assets")
+    fresh = []
     if oa is not None and pa is not None and oa != pa:
         fresh = sorted((k for k in pa if pa[k][0] and not (k in oa and oa[k][0])),
                        key=lambda k: (not paid(pa[k], p), k))
@@ -621,20 +678,40 @@ def diff_program(src, key, o, p):
         gone = sorted(k for k in oa if oa[k][0] and not (k in pa and pa[k][0]))
         if fresh or now_paid:
             hot = any(paid(pa[k], p) for k in fresh + now_paid)
-            kinds.append(((4 if hot else 3) if p["state"] == "open" else 2, "SCOPE"))
+            what = plural(len(fresh), "new target") if fresh else plural(len(now_paid), "target") + " now paid"
+            kinds.append(((4 if hot else 3) if live else 2, "SCOPE", what, "🔭"))
         elif gone or sev:
-            kinds.append((2, "SCOPE-"))
-        lines += [f"+ {show(k, pa[k])}" for k in fresh]
-        lines += [f"$ {show(k, pa[k])} now bounty-eligible" for k in now_paid]
-        lines += [f"~ {k.split('|', 1)[1]}: severity {oa[k][2]} → {pa[k][2]}" for k in sev]
-        lines += [f"− {show(k, oa[k])}" for k in gone]
-        if fresh:
-            title = f"🔭 +{len(fresh)} in scope: {p['name']} ({src.label})"
+            kinds.append((2, "SCOPE-", "scope changed" if sev else plural(len(gone), "target") + " removed", "✂️"))
+        lines += [asset_line("➕", k, pa[k], p) for k in fresh]
+        lines += [asset_line("💵", k, pa[k], p, "now bounty-eligible") for k in now_paid]
+        lines += [asset_line("⚖️", k, pa[k], p, f"severity {oa[k][2] or '?'} → {pa[k][2] or '?'}".lower()) for k in sev]
+        lines += [asset_line("➖", k, oa[k], o, "removed from scope") for k in gone]
+    if o["state"] != p["state"]:
+        meaning = STATE_MEANING.get(p["state"], "")
+        lines.append(f"🚦 {nice_state(o['state'])} → {nice_state(p['state'])}" + (f" ({meaning})" if meaning else ""))
+        if live:
+            kinds.append((4 if p["bounty"] else 3, "OPEN", "reopened" if p["state"] == "open" else nice_state(p["state"]).lower(), "🟢"))
+        else:
+            kinds.append((2, "STATE", nice_state(p["state"]).lower(), "🚦"))
+    if o["bounty"] != p["bounty"]:
+        lines.append("💰 Now pays bounties" if p["bounty"] else "💰 Stopped paying bounties (now VDP)")
+        kinds.append((4, "BOUNTY", "now pays bounties", "💰") if p["bounty"] else (2, "BOUNTY", "bounties dropped", "💰"))
+    elif o.get("max") and p.get("max") and _num(o["max"]) != _num(p["max"]):
+        up = _num(p["max"]) > _num(o["max"])
+        lines.append(f"💰 Max bounty {'raised' if up else 'lowered'}: {o['max']} → {p['max']}")
+        kinds.append((4 if up else 2, "BOUNTY", f"max bounty {'up' if up else 'down'}", "💰"))
     if not kinds:
         return None
-    prio, kind = max(kinds)
-    return event(src, key, p, kind, prio, lines, title if kind == "SCOPE" else None)
+    prio, kind, what, emoji = max(kinds, key=lambda k: k[0])
+    return event(src, p, kind, prio, what, lines, emoji)
 
+
+def gone_event(src, p):
+    return event(src, p, "GONE", 2, "no longer listed",
+                 ["⚠️ Gone from the public directory (closed, made private, or deleted)."], "⚠️")
+
+
+# ---------- diffing ----------
 
 def diff_source(src, prev, new, book):
     """-> (state to keep, events). Absent programs are carried for GONE_AFTER polls."""
@@ -644,7 +721,7 @@ def diff_source(src, prev, new, book):
         missing[k] = missing.get(k, 0) + 1
         if missing[k] >= GONE_AFTER:
             del missing[k]
-            events.append(event(src, k, prev[k], "GONE", 2, ["no longer in the public listing"]))
+            events.append(gone_event(src, prev[k]))
         else:
             merged[k] = prev[k]
     for k, p in new.items():
@@ -817,6 +894,42 @@ def ping(url):
         log(f"healthcheck ping failed: {e}")
 
 
+def samples():
+    """One of every notification kind, from fake programs, through the real builders."""
+    h1, imm, bc, inti = (SOURCES[n] for n in ("h1", "immunefi", "bugcrowd", "intigriti"))
+    url = "https://hackerone.com/directory/programs"
+    p = program("Example Corp", url, "open", True, "$10,000", assets={
+        "wildcard|*.example.com": [True, True, "critical"], "api|api.example.com": [True, True, "high"],
+        "ios|com.example.app": [True, False, "medium"], "url|legacy.example.com": [True, True, "critical"]})
+    new = dict(p, assets={k: v for k, v in p["assets"].items() if k != "url|legacy.example.com"})
+    new["assets"].update({"url|pay.example.com": [True, True, "critical"], "ios|com.example.app": [True, True, "high"],
+                          "api|graphql.example.com": [True, True, "critical"]})
+    vdp = program("Example Health VDP", url, "open", False, assets={"url|portal.examplehealth.org": [True, None, None]})
+    web3 = program("Example Protocol", "https://immunefi.com/bug-bounty/", "open", True, "$250,000",
+                   tags=["KYC"], assets={"smart_contract|0x1f98…F984": [True, True, None]})
+    ev = [
+        new_event(h1, "x", p),
+        diff_program(h1, "x", p, new),
+        diff_program(imm, "y", dict(web3, state="paused"), web3),
+        diff_program(bc, "z", dict(p, max="$5,000"), p),
+        diff_program(inti, "w", vdp, dict(vdp, bounty=True, max="€2,500")),
+        new_event(bc, "v", vdp),
+        diff_program(h1, "x", p, dict(p, state="paused")),
+        diff_program(h1, "x", p, dict(p, assets={k: v for k, v in p["assets"].items() if k != "url|legacy.example.com"})),
+        gone_event(imm, web3),
+        health("⚠️ bbwatch: Bugcrowd source failing", f"{FAIL_ALERT} polls in a row failed.\nHTTPError: HTTP Error 403: Forbidden",
+               3, "warning"),
+        health("✅ bbwatch: Bugcrowd source recovered", "back after 7 failed polls", 2, "white_check_mark"),
+        health("🩺 bbwatch resumed after 1h12m offline", "The watcher was not running. Everything that changed "
+               "meanwhile is diffed against the last snapshot on this first poll, so nothing is lost.", 2, "stethoscope"),
+        {"prio": 3, "url": None, "tag": "eyes", "title": "👁️ bbwatch armed",
+         "body": "Baseline recorded — changes from here on are pushed.\nH1: 751 programs\nBugcrowd: 287 programs"},
+        {"prio": 3, "url": None, "tag": "satellite", "title": "📡 bbwatch: +9 more changes",
+         "body": "🔭 Example Corp · H1 — 2 new targets\n🟢 Example Protocol · Immunefi — reopened\n…"},
+    ]
+    return [e for e in ev if e]
+
+
 # ---------- main ----------
 
 def parse_duration(s):
@@ -841,10 +954,15 @@ def main():
     if not topics() and not DRY_RUN:
         sys.exit("NTFY_TOPIC is required")
     if args.test or os.environ.get("BBWATCH_TEST", "").lower() in ("1", "true", "yes"):
-        for t in topics() or [""]:
-            publish({"topic": t, "title": "🔔 bbwatch test (medium)", "priority": 3, "tags": ["bell"],
-                     "message": "This came through the bbwatch -> ntfy pipeline.\n"
-                                "Priority 3 = medium: normal notification, no buzz under DND."})
+        evs = samples()
+        intro = health(f"🧪 bbwatch test — {len(evs)} sample notifications follow",
+                       "One of every kind bbwatch sends, built by the real message code.\n"
+                       "\"Example …\" programs are fake. Priorities are real: 5 buzzes, 4 high, 3 normal, 2 quiet.",
+                       3, "test_tube")
+        for e in [intro] + evs:
+            for t in topics() or [""]:
+                publish(dict(to_push(e), topic=t))
+            time.sleep(1.5)  # keep them in order on the phone
         return
     names = [s for s in args.sources.split(",") if s]
     unknown = [s for s in names if s not in SOURCES]
