@@ -10,6 +10,16 @@ pushes one ntfy notification per changed program — naming the exact assets.
   Intigriti  30s   Algolia programs index      lastUpdatedAt -> detail refetch (+ rotation)
   YesWeHack  45s   api.yeswehack.com/programs  last_update_at -> detail refetch (+ rotation)
   Immunefi   30s   immunefi.com/public-api     full feed, ETag-conditional (304s)
+  Cantina    60s   cantina.xyz/api/v0          bounties (scope inline) + competitions
+  HackenProof 60s  hackenproof.com/programs-api  bounties + audit contests; updated_at -> scope refetch
+  Sherlock   60s   mainnet-contest.sherlock.xyz  contests + bug bounties (last_updated -> scope)
+  Code4rena  2m    code4rena.com/api/v1/audits   contests
+  CodeHawks  60s   codehawks.cyfrin.io/trpc      competitive audits + first flights
+  Standoff   3m    api.standoff365.com           bug bounties (RUB; scope is prose only)
+  IssueHunt  2m    api.issuehunt.io/programs     bounties + VDPs (JPY), scope inline
+  Bugrap     2m    api.bugrap.io                 web3 bounties (no structured scope)
+  BugBase    2m    bugbase.ai/api/hacktivity     hosted programs + assets
+  huntr      10m   huntr.com/challenges (RSC)    AI red-team challenges
   Mirror     5m    arkadiyt/bounty-targets-data — independent scrape used as a
                    cross-check: assets it has that we don't force a direct refetch
 
@@ -28,7 +38,7 @@ Env:
   HEALTHCHECK_URL   optional — pinged at most every 5 min while polls succeed
   GITHUB_TOKEN      optional — raises the mirror's GitHub API rate limit
   INTERVAL          optional — override every direct source's interval (seconds)
-  SOURCES           optional — comma list of h1,bugcrowd,intigriti,ywh,immunefi,mirror
+  SOURCES           optional — comma list (default: all; see SOURCES at the bottom of the sources)
   MIN_PRIORITY      optional — drop pushes below this priority (default 2)
   DRY_RUN=1         optional — print pushes instead of sending them
   BBWATCH_TEST=1    optional — same as --test
@@ -119,10 +129,51 @@ def _at(lst, i):
     return lst[i] if isinstance(i, int) and 0 <= i < len(lst) else str(i)
 
 
+SYMBOLS = {"USD": "$", "USDC": "$", "USDT": "$", "DAI": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "RUB": "₽"}
+
+
 def money(v, cur="USD"):
-    sym = {"USD": "$", "EUR": "€", "GBP": "£"}.get(str(cur or "").upper())
-    v = int(v) if float(v).is_integer() else v
-    return f"{sym}{v:,}" if sym else f"{v:,} {cur}".strip()
+    v = float(v)
+    v = int(v) if v.is_integer() else round(v, 2)
+    sym = SYMBOLS.get(str(cur or "").upper())
+    return f"{sym}{v:,}" if sym else f"{v:,} {str(cur or '').upper()}".strip()
+
+
+def to_dt(v):
+    """ISO string, unix seconds/millis or "17 Nov 2025" -> aware datetime (None if unparseable)."""
+    if v in (None, ""):
+        return None
+    try:
+        if isinstance(v, (int, float)):
+            return datetime.fromtimestamp(v / 1000 if v > 1e12 else v, timezone.utc)
+        s = str(v).strip()
+        try:
+            d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            d = datetime.strptime(s, "%d %b %Y")
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def when(start, end=None):
+    """Contest window for humans: "Oct 3 → Oct 17"."""
+    a, b = to_dt(start), to_dt(end)
+    f = lambda d: f"{d:%b} {d.day}"
+    if a and b:
+        return f"{f(a)} → {f(b)}"
+    return f"from {f(a)}" if a else (f"until {f(b)}" if b else None)
+
+
+def contest_state(start, end, finished=False):
+    if finished:
+        return "ended"
+    now, a, b = datetime.now(timezone.utc), to_dt(start), to_dt(end)
+    if a and now < a:
+        return "upcoming"
+    if b and now >= b:
+        return "judging"
+    return "active"
 
 
 def _num(v):
@@ -140,13 +191,18 @@ def _num(v):
 #   assets  {"<type>|<identifier>": [in_scope, bounty_eligible|None, severity|None]}
 #           or None when the scope is not known (never diffed, never erases)
 
-def program(name, url, state, bounty, max_=None, sig=None, assets=None, tags=None, ref=None):
-    p = {"name": str(name or "?").strip(), "url": url, "state": state, "bounty": bool(bounty),
+def program(name, url, state, bounty, max_=None, sig=None, assets=None, tags=None, ref=None,
+            contest=False, window=None):
+    p = {"name": " ".join(str(name or "?").split()), "url": url, "state": state, "bounty": bool(bounty),
          "max": max_, "sig": sig, "assets": assets}
     if tags:
         p["tags"] = tags
     if ref:
         p["ref"] = ref
+    if contest:
+        p["contest"] = True
+    if window:
+        p["when"] = window  # shown in messages, never diffed
     return p
 
 
@@ -162,6 +218,9 @@ def add_asset(assets, ident, typ, in_scope=True, bounty=None, sev=None):
 
 
 # ---------- sources ----------
+
+DEAD = {"ended", "closed", "archived", "finished"}
+
 
 class Source:
     name = label = ""
@@ -195,9 +254,11 @@ class Source:
                 p["assets"] = o.get("assets")
                 if "ver" in o:
                     p["ver"] = o["ver"]
+            if p["state"] in DEAD:
+                continue
             if o is None or o.get("assets") is None or o.get("sig") != p.get("sig"):
                 want.add(k)
-        keys = sorted(progs)
+        keys = sorted(k for k in progs if progs[k]["state"] not in DEAD)  # don't spend requests on ended programs
         if self.rotate and keys:
             i = book.get("rot", 0) % len(keys)
             want.update((keys + keys)[i:i + min(self.rotate, len(keys))])
@@ -502,6 +563,326 @@ class Immunefi(Source):
         return out
 
 
+def guess_type(*hints):
+    """Asset type from free text (group names, URLs) for platforms without a type field."""
+    h = " ".join(str(x or "") for x in hints).lower()
+    for needle, typ in (("smart contract", "smart_contract"), ("contract", "smart_contract"),
+                        ("etherscan", "smart_contract"), ("scan.", "smart_contract"), ("0x", "smart_contract"),
+                        ("github.com", "source_code"), ("play.google", "android"), ("apps.apple", "ios"),
+                        ("android", "android"), ("ios", "ios"), ("api", "api"), ("*.", "wildcard"),
+                        ("http", "url"), ("web", "url"), ("blockchain", "blockchain"), ("protocol", "blockchain")):
+        if needle in h:
+            return typ
+    return "other"
+
+
+class Cantina(Source):
+    name, label = "cantina", "Cantina"
+    every = 60
+    CONTEST = {"upcoming": "upcoming", "live": "active", "judging": "judging", "escalations": "judging",
+               "escalations_ended": "judging", "complete": "ended", "published": "ended", "draft": "upcoming"}
+
+    def listing(self, prev, book):
+        out = {}
+        for kind in ("bounties", "competitions"):
+            for b in get_json(f"https://cantina.xyz/api/v0/{kind}", timeout=60):
+                contest = "contest" in str(b.get("kind") or kind)
+                st = str(b.get("status") or "").lower()
+                pot = _num(b.get("totalRewardPot"))
+                t = b.get("timeframe") or {}
+                assets = None
+                if b.get("assetGroups"):
+                    assets = {}
+
+                    def walk(groups):
+                        for g in groups or []:
+                            paid = any(r.get("maxReward") not in (None, "", "0") for r in g.get("rewards") or [])
+                            for a in g.get("assets") or []:
+                                if a.get("hidden"):
+                                    continue
+                                desc = str(a.get("description") or "").strip()
+                                ident = desc if desc.startswith(("http", "0x")) else (a.get("name") or desc)
+                                add_asset(assets, ident, guess_type(g.get("name"), ident), not g.get("outOfScope"),
+                                          paid or None)
+                            walk(g.get("subGroups"))
+                    walk(b["assetGroups"])
+                tags = (["private"] if str(b.get("kind", "")).startswith("private") else []) + \
+                       (["KYC"] if b.get("kycRequired") else [])
+                if contest:
+                    state = self.CONTEST.get(st, st)
+                else:  # a bounty past "live" is over (judging/escalations/complete)
+                    state = {"live": "open", "upcoming": "upcoming", "draft": "upcoming"}.get(st, "closed")
+                out[b["id"]] = program(
+                    b.get("name") or (b.get("company") or {}).get("name"), b.get("url"), state, pot > 0,
+                    money(pot, b.get("currencyCode")) if pot else None, assets=assets, tags=tags,
+                    contest=contest, window=when(t.get("start"), t.get("end")) if contest else None)
+        return out
+
+
+class HackenProof(Source):
+    name, label = "hackenproof", "HackenProof"
+    every = 60
+    rotate = 10
+    workers = 3  # 5 parallel detail fetches trip its 429s
+
+    def listing(self, prev, book):
+        rows, page = [], 1
+        while page:
+            d = get_json(f"https://hackenproof.com/programs-api/programs?page={page}&per_page=100", timeout=60)
+            rows += d.get("programs") or []
+            page = d.get("next_page")
+        out = {}
+        for r in rows:
+            audit = bool(r.get("audit_program"))
+            st = str((r.get("status") or {}).get("name") or "").lower()
+            if r.get("state") == "paused":
+                state = "paused"
+            elif audit:
+                state = contest_state(r.get("start_date"), None, st == "completed")
+            else:
+                state = "open" if st == "active" else ("closed" if st == "completed" else st or "open")
+            mx = _num(r.get("max_bounty"))
+            out[r["slug"]] = program(
+                r.get("title"), f"https://hackenproof.com/programs/{r['slug']}", state, mx > 0,
+                money(mx) if mx else None, sig=f"{r.get('updated_at')}|{r.get('max_bounty')}",
+                tags=["KYC"] if r.get("kyc_required") else None, contest=audit,
+                window=when(r.get("start_date"), r.get("end_date")) if audit else None)
+        return out
+
+    def detail(self, key, p):
+        d = get_json(f"https://hackenproof.com/programs-api/programs/{q(key)}", timeout=60)
+        assets = {}
+        for s in d.get("scopes") or []:
+            crit = str(s.get("criticality") or "").lower()
+            add_asset(assets, s.get("target"), s.get("title"), not s.get("out_of_scope"),
+                      p["bounty"] and crit not in ("none", ""), None if crit in ("none", "") else crit)
+        p["assets"] = assets
+
+
+class Sherlock(Source):
+    name, label = "sherlock", "Sherlock"
+    every = 60
+    API = "https://mainnet-contest.sherlock.xyz"
+    STATES = {"CREATED": "upcoming", "RUNNING": "active", "SHERLOCK_JUDGING": "judging", "JUDGING": "judging",
+              "ESCALATING": "judging", "FINISHED": "ended"}
+
+    def listing(self, prev, book):
+        out = {}
+        for c in get_json(f"{self.API}/contests?page=1&per_page=1000&order_by_date=true", timeout=60).get("items") or []:
+            pot = _num(c.get("prize_pool"))
+            tags = [c["type_label"]] if c.get("type_label") and c["type_label"] != "Public" else []
+            out[f"c{c['id']}"] = program(
+                c.get("title"), f"https://audits.sherlock.xyz/contests/{c['id']}",
+                self.STATES.get(c.get("status"), str(c.get("status")).lower()), pot > 0,
+                money(pot, c.get("token")) if pot else None, tags=tags, contest=True,
+                window=when(c.get("starts_at"), c.get("ends_at")))
+        for b in get_json(f"{self.API}/bug_bounties?page=1&per_page=100", timeout=60).get("items") or []:
+            pay = _num(b.get("payout"))
+            out[f"b{b['id']}"] = program(
+                b.get("title"), f"https://audits.sherlock.xyz/bug-bounties/{b['id']}",
+                "open" if b.get("is_ready", True) else "paused", pay > 0,
+                money(pay, b.get("display_currency")) if pay else None, sig=b.get("last_updated"))
+        return out
+
+    def detail(self, key, p):
+        if not key.startswith("b"):
+            return  # contests: no structured scope in the API before they start
+        d = get_json(f"{self.API}/bug_bounties/{key[1:]}", timeout=60)
+        assets = {}
+        for s in d.get("covered_scope") or []:
+            if s.get("address"):
+                add_asset(assets, s["address"], "smart_contract", True, True)
+            elif s.get("repo_name"):  # per-file entries collapse to their repo
+                add_asset(assets, f"github.com/{s['repo_name']}", "source_code", True, True)
+        for u in d.get("url_scope") or []:
+            add_asset(assets, u.get("url") if isinstance(u, dict) else u, "url", True, True)
+        p["assets"] = assets
+
+
+class Code4rena(Source):
+    name, label = "code4rena", "Code4rena"
+    every = 120
+    OPEN = {"Booking": "upcoming", "Pre-Audit": "upcoming", "Active": "active", "LiveJudging": "active",
+            "Completed": "ended", "Lost Deal": "closed"}
+
+    def listing(self, prev, book):
+        url = "https://code4rena.com/api/v1/audits?perPage=100&sortBy=startTime&sortOrder=desc&page={}"
+        first = get_json(url.format(1), timeout=60)
+        rows = first["data"]["audits"]
+        last = int((first.get("pagination") or {}).get("lastPage") or 1)
+        with ThreadPoolExecutor(4) as ex:
+            for d in ex.map(lambda n: get_json(url.format(n), timeout=60), range(2, last + 1)):
+                rows += d["data"]["audits"]
+        out = {}
+        for a in rows:
+            st = self.OPEN.get(a.get("status"), "judging")
+            if st == "active":
+                st = contest_state(a.get("startTime"), a.get("endTime"))
+            amt = str(a.get("formattedAmount") or "")
+            assets = {f"source_code|{a['repo']}": [True, True, None]} if a.get("repo") else None
+            tags = [t for t in (a.get("league"), a.get("auditType") if a.get("auditType") != "Audit" else None,
+                                "private code" if a.get("codeAccess") not in (None, "public") else None) if t]
+            out[a["uid"]] = program(
+                a.get("title") or (a.get("org") or {}).get("name"), f"https://code4rena.com/audits/{a['slug']}", st,
+                _num(amt.split(" in ")[0]) > 0, amt.split(" in ")[0] or None, assets=assets, tags=tags, contest=True,
+                window=when(a.get("startTime"), a.get("endTime")))
+        return out
+
+
+class CodeHawks(Source):
+    name, label = "codehawks", "CodeHawks"
+    every = 60
+
+    def listing(self, prev, book):
+        d = get_json("https://codehawks.cyfrin.io/trpc/competitions.getCompetitions,competitions.getFirstFlights"
+                     "?batch=1&input=%7B%7D", timeout=60)
+        out = {}
+        for part, first_flight in ((d[0], False), (d[1], True)):
+            for c in part["result"]["data"]:
+                cur = str(c.get("currency") or "").upper()
+                pot = _num(c.get("reward"))
+                prize = (money(pot, cur) if cur in SYMBOLS else f"{pot:g} {cur}") if pot else None
+                tags = [t for t, on in (("First Flight", first_flight), ("invite-only", c.get("inviteOnly")),
+                                        ("KYC", c.get("requiresKyc")),
+                                        (f"{c['nsloc']} nSLOC", c.get("nsloc"))) if on]
+                out[c["id"]] = program(
+                    c.get("name"), f"https://codehawks.cyfrin.io/c/{c.get('urlSlug')}",
+                    contest_state(c.get("startDate"), c.get("endDate"), bool(c.get("finalised"))), pot > 0, prize,
+                    assets={f"source_code|{c['githubUrl']}": [True, pot > 0, None]} if c.get("githubUrl") else None,
+                    tags=tags, contest=True, window=when(c.get("startDate"), c.get("endDate")))
+        return out
+
+
+class Standoff(Source):
+    name, label = "standoff", "Standoff 365"
+    every = 180
+
+    def listing(self, prev, book):
+        d = get_json("https://api.standoff365.com/api/bug-bounty/ui/program?page=1&pagesize=500", timeout=90)
+        out = {}
+        for r in d.get("items") or []:
+            if r.get("finished"):
+                state = "ended"
+            elif r.get("status") == "published":
+                state = "open"
+            else:
+                state = "closed" if r.get("status") in ("archived", "finished") else str(r.get("status"))
+            rub = (((r.get("statistics") or {}).get("rewards") or {}).get("rub") or {}).get("max") or 0
+            tags = ["application"] if r.get("visibility") == "with_confirmation" else None
+            vendor = (r.get("vendor") or {}).get("name")
+            name = r.get("name") if not vendor or vendor.lower() in str(r.get("name")).lower() else f"{vendor} {r.get('name')}"
+            out[r["slug"]] = program(name, f"https://bugbounty.standoff365.com/en-US/programs/{r['slug']}", state,
+                                     rub > 0, money(rub, "RUB") if rub else None, sig=r.get("updatedAt"), tags=tags)
+        return out
+
+
+class IssueHunt(Source):
+    name, label = "issuehunt", "IssueHunt"
+    every = 120
+
+    def listing(self, prev, book):
+        out, page = {}, 1
+        while True:
+            d = get_json(f"https://api.issuehunt.io/programs?page={page}", timeout=60)
+            rows = d.get("data") or []
+            for r in rows:
+                paid = r.get("type") == "bounty"
+                crit = ((r.get("rewards") or {}).get("criticalityRewards") or {})
+                mx = max([_num((v or {}).get("to")) for v in crit.values()] or [0])
+                assets = {}
+                for g in r.get("scopeGroups") or []:
+                    typ = (g.get("type") or ["other"])[0]
+                    for ident in re.split(r"[,\s]+", str(g.get("identifier") or "")):
+                        add_asset(assets, ident, typ, True, paid or None)
+                if r.get("deleted") or not r.get("activated"):
+                    state = "closed"
+                else:
+                    state = "paused" if r.get("frozen") else "open"
+                org = (r.get("organization") or {}).get("name")
+                out[r["id"]] = program(org or r.get("name"), f"https://issuehunt.io/programs/{r.get('slug') or r['id']}",
+                                       state, paid and mx > 0, money(mx, "JPY") if mx else None, assets=assets,
+                                       tags=["application"] if r.get("visibility") == "application" else None)
+            if len(rows) < int(d.get("perPage") or 100):
+                return out
+            page += 1
+
+
+class Bugrap(Source):
+    name, label = "bugrap", "Bugrap"
+    every = 120
+
+    def listing(self, prev, book):
+        url = "https://api.bugrap.io/api/v1/companies?page={}&pageSize=10&sort=id,desc"
+        first = get_json(url.format(1))
+        if str(first.get("code")) != "10000":
+            raise RuntimeError(f"api code {first.get('code')}")
+        rows = list(first["data"]["list"])
+        with ThreadPoolExecutor(3) as ex:
+            for d in ex.map(lambda n: get_json(url.format(n)), range(2, int(first["data"]["last_page"]) + 1)):
+                rows += d["data"]["list"]
+        out = {}
+        for r in rows:
+            mx = _num(r.get("max_reward"))
+            cat = (r.get("category") or {}).get("name")
+            out[str(r["id"])] = program(r.get("name"), f"https://bugrap.io/bounties/{q(r.get('name'))}", "open",
+                                        mx > 0, money(mx, r.get("reward_symbol")) if mx else None,
+                                        tags=[cat] if cat else None)
+        return out
+
+
+class BugBase(Source):
+    name, label = "bugbase", "BugBase"
+    every = 120
+
+    def listing(self, prev, book):
+        d = get_json("https://bugbase.ai/api/hacktivity?current_page=1&limit=500&search_term=&filter=", timeout=60)
+        out = {}
+        for r in d.get("companies") or []:
+            if r.get("isExternal") or r.get("isPrivate"):
+                continue  # placeholder profiles of companies not on BugBase
+            mx = _num(r.get("maxBounty"))
+            paid = r.get("programType") == "bugbounty" and mx > 0
+            out[r["programUsername"]] = program(
+                r.get("programName"), f"https://bugbase.ai/programs/{r['programUsername']}",
+                "open" if r.get("isAcceptingBugs") else "paused", paid, money(mx) if paid else None,
+                sig=hashlib.sha1(json.dumps([r.get("scopeGroups"), r.get("bountyVals")], sort_keys=True,
+                                            default=str).encode()).hexdigest()[:12])
+        return out
+
+    def detail(self, key, p):
+        d = get_json(f"https://bugbase.ai/api/hacktivity/get-program-assets/{q(key)}"
+                     "?current_page=1&limit=100&search_term=", timeout=60)
+        assets = {}
+        for a in d.get("assets") or []:
+            add_asset(assets, a.get("url") or a.get("assetName"), a.get("assetType"),
+                      str(a.get("status") or "active").lower() not in ("inactive", "out_of_scope", "archived"),
+                      p["bounty"] or None)
+        p["assets"] = assets
+
+
+class Huntr(Source):
+    name, label = "huntr", "huntr"
+    every = 600
+    RE = re.compile(r'\{"id":"[0-9a-f-]{36}","title".*?"filteredStage":[^}]*\}')
+
+    def listing(self, prev, book):
+        _, body, _ = fetch("https://huntr.com/challenges", headers={"RSC": "1", "Accept": "*/*"}, timeout=60)
+        out = {}
+        for m in self.RE.finditer(body):
+            try:
+                c = json.loads(m.group(0))
+            except ValueError:
+                continue
+            stage = str(c.get("stage") or "").lower()
+            pot = _num(c.get("total_prize_amount"))
+            out[c["id"]] = program(c.get("title"), f"https://huntr.com/challenges/{c['id']}/v1/rules",
+                                   {"closed": "ended"}.get(stage, stage), pot > 0, money(pot) if pot else None,
+                                   contest=True, window=when(c.get("start_date"), c.get("end_date")))
+        if not out:
+            raise RuntimeError("no challenges parsed from the RSC payload (page format changed?)")
+        return out
+
+
 class Mirror(Source):
     """arkadiyt/bounty-targets-data: an independent scrape of the same platforms (every ~30 min).
 
@@ -566,7 +947,8 @@ def reconcile(state, mirror, by_name):
             + (f" -> refetching {', '.join(sorted(behind)[:5])}{' …' if len(behind) > 5 else ''}" if behind else ""))
 
 
-SOURCES = {s.name: s for s in (HackerOne, Bugcrowd, Intigriti, YesWeHack, Immunefi, Mirror)}
+SOURCES = {s.name: s for s in (HackerOne, Bugcrowd, Intigriti, YesWeHack, Immunefi, Cantina, HackenProof, Sherlock,
+                                Code4rena, CodeHawks, Standoff, IssueHunt, Bugrap, BugBase, Huntr, Mirror)}
 
 
 # ---------- messages ----------
@@ -584,16 +966,17 @@ SOURCES = {s.name: s for s in (HackerOne, Bugcrowd, Intigriti, YesWeHack, Immune
 LIVE = {"open", "active", "live", "upcoming"}  # states where a hunter can (soon) submit
 
 TYPE_NAMES = {
-    "Web": ("url", "website", "web-application", "websites_and_applications", "web", "application"),
+    "Web": ("url", "website", "web-application", "websites_and_applications", "web", "application", "domain",
+            "web app", "webapp"),
     "Wildcard": ("wildcard",),
     "API": ("api",),
-    "Android app": ("android", "google_play_app_id", "mobile-application-android", "other_apk"),
-    "iOS app": ("ios", "apple_store_app_id", "mobile-application-ios", "testflight", "other_ipa"),
+    "Android app": ("android", "google_play_app_id", "mobile-application-android", "other_apk", "android app"),
+    "iOS app": ("ios", "apple_store_app_id", "mobile-application-ios", "testflight", "other_ipa", "ios app"),
     "Mobile app": ("mobile-application", "mobile"),
     "Desktop app": ("downloadable_executables", "windows_app_store_app_id", "executable", "desktop"),
-    "Source code": ("source_code", "github", "repository", "repo"),
-    "Smart contract": ("smart_contract", "smart-contract", "contract"),
-    "Blockchain": ("blockchain_dlt", "blockchain", "protocol"),
+    "Source code": ("source_code", "github", "repository", "repo", "8"),  # 8 = Intigriti's source-code type id
+    "Smart contract": ("smart_contract", "smart-contract", "contract", "smart contract", "smart contracts"),
+    "Blockchain": ("blockchain_dlt", "blockchain", "protocol", "bridge", "blockchain/dlt"),
     "IP": ("ip_address", "ip"),
     "IP range": ("cidr", "iprange", "ip_range"),
     "Network": ("network",),
@@ -604,7 +987,7 @@ TYPE_NAME = {raw: nice for nice, raws in TYPE_NAMES.items() for raw in raws}
 STATE_NAMES = {"open": "Open", "paused": "Paused", "closed": "Closed", "ended": "Ended", "suspended": "Suspended",
                "closing": "Closing", "archived": "Archived", "upcoming": "Upcoming", "active": "Live",
                "live": "Live", "judging": "Judging"}
-STATE_MEANING = {"open": "accepting reports again", "active": "live now", "live": "live now",
+STATE_MEANING = {"open": "accepting reports again", "active": "submissions open", "live": "submissions open",
                  "paused": "not accepting reports", "suspended": "not accepting reports",
                  "closed": "closed", "ended": "ended", "judging": "submissions closed, judging",
                  "upcoming": "starting soon"}
@@ -624,7 +1007,7 @@ def asset_line(mark, k, a, p, note=""):
     if len(ident) > 64:
         ident = ident[:63] + "…"
     bits = [TYPE_NAME.get(typ, "Other" if typ.isdigit() else typ.replace("_", " ").capitalize())]
-    if p["bounty"]:
+    if p["bounty"] and not p.get("contest"):
         bits.append("bounty" if paid(a, p) else "no bounty")
     if a[2] and str(a[2]).lower() not in ("none", "null"):
         bits.append(str(a[2]).lower().replace("_", " "))
@@ -633,7 +1016,11 @@ def asset_line(mark, k, a, p, note=""):
 
 def summary(p):
     bits = [nice_state(p["state"])]
-    if p["bounty"]:
+    if p.get("contest"):
+        bits.append(f"prize pool {p['max']}" if p.get("max") else "no prize pool")
+        if p.get("when"):
+            bits.append(p["when"])
+    elif p["bounty"]:
         bits.append(f"pays up to {p['max']}" if p.get("max") else "pays bounties")
     else:
         bits.append("no bounty (VDP)")
@@ -907,6 +1294,9 @@ def samples():
     vdp = program("Example Health VDP", url, "open", False, assets={"url|portal.examplehealth.org": [True, None, None]})
     web3 = program("Example Protocol", "https://immunefi.com/bug-bounty/", "open", True, "$250,000",
                    tags=["KYC"], assets={"smart_contract|0x1f98…F984": [True, True, None]})
+    contest = program("Example Lending", "https://code4rena.com/audits", "upcoming", True, "$50,000",
+                      assets={"source_code|https://github.com/code-423n4/2026-10-example-lending": [True, True, None]},
+                      tags=["Ethereum"], contest=True, window="Oct 3 → Oct 17")
     ev = [
         new_event(h1, "x", p),
         diff_program(h1, "x", p, new),
@@ -917,6 +1307,8 @@ def samples():
         diff_program(h1, "x", p, dict(p, state="paused")),
         diff_program(h1, "x", p, dict(p, assets={k: v for k, v in p["assets"].items() if k != "url|legacy.example.com"})),
         gone_event(imm, web3),
+        new_event(SOURCES["code4rena"], "c", contest),
+        diff_program(SOURCES["code4rena"], "c", contest, dict(contest, state="active")),
         health("⚠️ bbwatch: Bugcrowd source failing", f"{FAIL_ALERT} polls in a row failed.\nHTTPError: HTTP Error 403: Forbidden",
                3, "warning"),
         health("✅ bbwatch: Bugcrowd source recovered", "back after 7 failed polls", 2, "white_check_mark"),

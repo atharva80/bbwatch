@@ -14,7 +14,24 @@ naming the exact assets that were added.
 | Intigriti | 30s   | Algolia `programs_prod` index           | `lastUpdatedAt` → detail refetch (+ rotation)  |
 | YesWeHack | 45s   | `api.yeswehack.com/programs`            | `last_update_at`/`scopes_count` → detail refetch (+ rotation) |
 | Immunefi  | 30s   | `immunefi.com/public-api/bounties.json` | full feed with ETag — a `304` costs nothing    |
+| Cantina   | 60s   | `cantina.xyz/api/v0/{bounties,competitions}` | bounties with inline scope + competitions |
+| HackenProof | 60s | `hackenproof.com/programs-api/programs` | bounties + audit contests; `updated_at` → scope refetch (+ rotation) |
+| Sherlock  | 60s   | `mainnet-contest.sherlock.xyz`          | contests + bug bounties; `last_updated` → scope refetch |
+| Code4rena | 2m    | `code4rena.com/api/v1/audits`           | contests (upcoming → live → judging → ended)   |
+| CodeHawks | 60s   | `codehawks.cyfrin.io/trpc`              | competitive audits + First Flights             |
+| Standoff 365 | 3m | `api.standoff365.com/api/bug-bounty`    | bug bounties in ₽ (scope is prose only)        |
+| IssueHunt | 2m    | `api.issuehunt.io/programs`             | bounties + VDPs in ¥, scope inline             |
+| Bugrap    | 2m    | `api.bugrap.io/api/v1/companies`        | web3 bounties (no structured scope)            |
+| BugBase   | 2m    | `bugbase.ai/api/hacktivity`             | hosted programs + their assets                 |
+| huntr     | 10m   | `huntr.com/challenges` (RSC payload)    | AI red-team challenges                         |
 | Mirror    | 5m    | `arkadiyt/bounty-targets-data`          | cross-check only (below)                       |
+
+Contests (Code4rena, CodeHawks, Sherlock, Cantina/HackenProof competitions,
+huntr) push when announced (🆕, priority 5 with a prize pool) and when they
+go live (🟢, 4), with the prize pool and dates in every message.
+
+Not covered: Hats Finance (shut down 2025-12-31), Remedy (Cloudflare JS
+challenge), Safevuln (inactive since 2022), Secure3 (unverified).
 
 **Cross-check.** The arkadiyt mirror is an independent scrape of H1, Bugcrowd,
 Intigriti and YesWeHack. Whenever it publishes a new commit, every program is
@@ -104,4 +121,3 @@ python3 report.py --hours 48 --out ~/BB/pipeline/changes.json
 
 - Private / invited programs — needs your platform API credentials
   (H1 `/v1/hackers/programs`, Intigriti researcher API, bbscope).
-- HackenProof — its public listing moved; the upstream scraper is broken too.
