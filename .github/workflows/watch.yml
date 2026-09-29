@@ -1,25 +1,30 @@
 name: bbwatch
 
-# 24/7 public bug-bounty watcher. Runs in GitHub's cloud — nothing on the
-# user's machine needs to be on. Every ~10 minutes it polls
-# arkadiyt/bounty-targets-data (which itself refreshes every ~30 min),
-# diffs structured data, and pushes events to ntfy.
+# Near-real-time public bug-bounty watcher, running in GitHub's cloud.
 #
-# The state.json commit at the end is also what keeps GitHub from
-# disabling this schedule after 60 days of repository inactivity.
+# Each run watches for ~5h40m. Its FIRST step queues its successor, which the
+# concurrency group holds back until this run ends — whichever way it ends
+# (finished, crashed, timed out, cancelled) — so there is always a next run
+# and the handover gap is the ~30s runner start-up. keeper.yml is the backstop
+# (cron, on every watch completion, hung-run watchdog). Nothing depends on
+# GitHub's cron firing on time.
+#
+# The snapshot lives on the orphan branch `state` (one force-pushed commit),
+# restored at start and synced whenever a push goes out (else every 10 min).
+#
+# Stop everything: `gh workflow disable keeper.yml && gh workflow disable watch.yml`,
+# then cancel the running/queued watch runs.
 
 on:
-  schedule:
-    - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
-      test:
-        description: "Send a test notification instead of watching"
-        type: boolean
-        default: false
+      minutes:
+        description: "How long this run watches before handing over"
+        default: "340"
 
 permissions:
-  contents: write
+  contents: write   # push the state branch
+  actions: write    # queue the successor, keep keeper.yml enabled
 
 concurrency:
   group: bbwatch
@@ -28,28 +33,44 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 355
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Poll and notify
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
-          BBWATCH_TEST: ${{ inputs.test }}
-        run: python3 watch.py
+      - name: Queue successor
+        run: bash .github/ensure-watcher.sh "$GITHUB_RUN_ID"
 
-      - name: Commit state
+      - name: Keep the keeper's schedule alive
+        # GitHub disables cron workflows after 60 days without repo activity;
+        # re-enabling through the API resets that without commits on main.
+        run: gh workflow enable keeper.yml || true
+
+      - name: Restore state
         run: |
-          git config user.name "bbwatch-bot"
-          git config user.email "bbwatch-bot@users.noreply.github.com"
-          git add state.json
-          if ! git diff --cached --quiet; then
-            git commit -m "state: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            git push
+          mkdir -p .state
+          if git fetch -q --depth=1 origin state 2>/dev/null; then
+            git show FETCH_HEAD:state.json.gz > .state/state.json.gz
+            echo "restored state from $(git log -1 --format=%s FETCH_HEAD)"
+          else
+            echo "no state branch yet: this run records the baseline"
           fi
-# nudge 2026-09-21T20:59:18Z
-# nudge2 2026-09-21T21:22:35Z
+
+      - name: Watch
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+          GITHUB_TOKEN: ${{ github.token }}
+          STATE_SYNC_CMD: bash .github/sync-state.sh
+        run: python3 watch.py --loop --for "${{ inputs.minutes || '340' }}m"
+
+      - name: Save state
+        if: always()
+        run: bash .github/sync-state.sh
+
+      - name: Make sure a successor is still queued
+        if: always()
+        run: bash .github/ensure-watcher.sh "$GITHUB_RUN_ID"

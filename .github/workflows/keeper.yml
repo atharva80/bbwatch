@@ -1,0 +1,64 @@
+name: keeper
+
+# Backstop for watch.yml, three triggers deep:
+#   - every 5 min (GitHub's cron is unreliable here, so it is not the only one)
+#   - every time a watch run completes, whatever its conclusion
+#   - by hand, which is also where test pushes are sent from (a test through
+#     watch.yml would queue behind the running watcher for hours)
+# It cancels a watch run that has stopped syncing state (hung), then makes
+# sure some watch run is running or queued.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_run:
+    workflows: [bbwatch]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send a test notification"
+        type: boolean
+        default: false
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: keeper
+  cancel-in-progress: false
+
+jobs:
+  keep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test push
+        if: ${{ inputs.test }}
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+        run: python3 watch.py --test
+
+      - name: Watchdog
+        # A healthy watcher syncs status.json at least every ~10 min.
+        run: |
+          updated=$(gh api "repos/$GH_REPO/contents/status.json?ref=state" --jq .content 2>/dev/null \
+            | base64 -d | jq -r .updated) || { echo "no status yet"; exit 0; }
+          age=$(( $(date +%s) - $(date -d "$updated" +%s) ))
+          echo "state last synced ${age}s ago ($updated)"
+          [ "$age" -gt 1800 ] || exit 0
+          for id in $(gh run list --workflow watch.yml --status in_progress --json databaseId,startedAt \
+              --jq '.[] | select((now - (.startedAt | fromdateiso8601)) > 1800) | .databaseId'); do
+            echo "watch run $id has not synced for ${age}s: cancelling it (its queued successor takes over)"
+            gh run cancel "$id" || true
+          done
+
+      - name: Ensure a watcher is running or queued
+        run: bash .github/ensure-watcher.sh
