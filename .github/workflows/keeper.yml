@@ -47,13 +47,17 @@ jobs:
         run: python3 watch.py --test
 
       - name: Watchdog
-        # A healthy watcher syncs status.json at least every ~10 min.
+        # A healthy watcher syncs status.json at least every ~10 min. This is
+        # the independent half of the check: even if a wedged run fools
+        # ensure-watcher.sh, a state file that has not moved for 30 min means
+        # nothing is watching, whatever the run list claims.
         run: |
           updated=$(gh api "repos/$GH_REPO/contents/status.json?ref=state" --jq .content 2>/dev/null \
             | base64 -d | jq -r .updated) || { echo "no status yet"; exit 0; }
           age=$(( $(date +%s) - $(date -d "$updated" +%s) ))
           echo "state last synced ${age}s ago ($updated)"
           [ "$age" -gt 1800 ] || exit 0
+          echo "state is stale by ${age}s: no watcher is actually working"
           for id in $(gh run list --workflow watch.yml --status in_progress --json databaseId,startedAt \
               --jq '.[] | select((now - (.startedAt | fromdateiso8601)) > 1800) | .databaseId'); do
             echo "watch run $id has not synced for ${age}s: cancelling it (its queued successor takes over)"

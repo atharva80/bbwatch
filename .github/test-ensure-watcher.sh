@@ -7,19 +7,22 @@ PASS=0; FAIL=0
 ok()  { echo "  PASS $1"; PASS=$((PASS+1)); }
 bad() { echo "  FAIL $1: $2"; FAIL=$((FAIL+1)); }
 
-run_case() { # name  runs.json  exclude_id  expect_live  expect_cancel  expect_dispatch
+run_case() { # name runs.json exclude expect_live expect_cancel expect_dispatch
   local name="$1" runs="$2" exclude="$3" exp_live="$4" exp_cancel="$5" exp_disp="$6"
   local d; d=$(mktemp -d)
+  # CANCEL_FAILS=1 makes `gh run cancel` exit 1, the way GitHub's API really
+  # behaves for a run wedged in pending/queued (HTTP 409).
   cat >"$d/gh" <<'EOF'
 #!/usr/bin/env bash
 case "$1 $2" in
   "run list")     cat "$FAKE_RUNS" ;;
-  "run cancel")   echo "CANCELLED $3" >> "$FAKE_LOG" ;;
+  "run cancel")   [ "${CANCEL_FAILS:-0}" = 1 ] && exit 1
+                  echo "CANCELLED $3" >> "$FAKE_LOG"; exit 0 ;;
   "workflow run") echo "DISPATCHED" >> "$FAKE_LOG"; exit 0 ;;
 esac
 EOF
   chmod +x "$d/gh"; : >"$d/log"
-  FAKE_RUNS="$runs" FAKE_LOG="$d/log" PATH="$d:$PATH" \
+  FAKE_RUNS="$runs" FAKE_LOG="$d/log" CANCEL_FAILS="${CANCEL_FAILS:-0}" PATH="$d:$PATH" \
     bash /tmp/bbw/.github/ensure-watcher.sh "$exclude" >"$d/out" 2>&1
   local live disp ncancel
   live=$(grep -oP 'already running/queued: \K\d+' "$d/out" || echo 0)
@@ -42,7 +45,8 @@ s=sys.argv[1]
 for k,v in {'__NOW__':now.strftime('%Y-%m-%dT%H:%M:%SZ'),
             '__NEW__':(now-datetime.timedelta(seconds=60)).strftime('%Y-%m-%dT%H:%M:%SZ'),
             '__MID__':(now-datetime.timedelta(minutes=40)).strftime('%Y-%m-%dT%H:%M:%SZ'),
-            '__OLD__':(now-datetime.timedelta(days=4)).strftime('%Y-%m-%dT%H:%M:%SZ')}.items():
+            '__OLD__':(now-datetime.timedelta(days=4)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            '__ANCIENT__':(now-datetime.timedelta(days=400)).strftime('%Y-%m-%dT%H:%M:%SZ')}.items():
     s=s.replace(k,v)
 json.dump(json.loads(s),open('/tmp/case.json','w'))
 print('/tmp/case.json')" "$1"; }
@@ -53,21 +57,18 @@ BOTH='[{"databaseId":36801233593,"status":"pending","createdAt":"__OLD__","start
 FRESHQ='[{"databaseId":1001,"status":"queued","createdAt":"__NEW__","startedAt":"__NEW__"}]'
 MIDQ='[{"databaseId":1003,"status":"queued","createdAt":"__MID__","startedAt":"__MID__"}]'
 DONERUN='[{"databaseId":1002,"status":"completed","createdAt":"__NOW__","startedAt":"__NOW__"}]'
+ANCIENT='[{"databaseId":777,"status":"pending","createdAt":"__ANCIENT__","startedAt":"__ANCIENT__"}]'
 
 echo "Scenario 1: the Oct 1 production state — one 4-day-old pending zombie, no live run."
 run_case "zombie reaped and replaced" "$(case_json "$ZOMBIE")" 0 0 1 1
 
 echo
-echo "Scenario 2: zombie + the run we are inside (in_progress). Keeper path: exclude=0."
+echo "Scenario 2: zombie + the run we are inside (in_progress). Keeper path, exclude=0."
 run_case "live run suppresses dispatch" "$(case_json "$BOTH")" 0 1 0 0
 
 echo
 echo "Scenario 3: the real watch.yml call — exclude our own id, only a 4-day zombie left."
-run_case "self-exclude reaps the stale successor" "$(case_json "$BOTH")" 37281693900 0 1 1
-
-echo
-echo "Scenario 3b: watch.yml excludes self, and its real successor is freshly queued."
-run_case "self-exclude sees fresh successor" "$(case_json "$FRESHQ")" 9999 1 0 0
+run_case "self-exclude reaps the stale run" "$(case_json "$BOTH")" 37281693900 0 1 1
 
 echo
 echo "Scenario 4: freshly queued successor (normal handover) counts as live."
@@ -86,8 +87,16 @@ echo "Scenario 7: only completed runs -> dispatch."
 run_case "completed-only dispatch" "$(case_json "$DONERUN")" 0 0 0 1
 
 echo
-echo "Scenario 8: queued successor whose queueing is older than STALE_SECS but <30min stays live."
-run_case "sub-30min queued stays live" "$(case_json "$FRESHQ")" 0 1 0 0
+echo "Scenario 8: an un-cancellable pending run 400 days old is out of the reap window."
+run_case "ancient zombie ignored, dispatch anyway" "$(case_json "$ANCIENT")" 0 0 0 1
+
+echo
+echo "Scenario 9: un-cancellable zombie (GitHub 409) must still dispatch — the real fix."
+CANCEL_FAILS=1 run_case "cancel 409 still dispatches" "$(case_json "$ZOMBIE")" 0 0 0 1
+
+echo
+echo "Scenario 10: un-cancellable zombie but a live run exists -> nothing to do."
+CANCEL_FAILS=1 run_case "cancel 409 with live run is quiet" "$(case_json "$BOTH")" 0 1 0 0
 
 echo
 echo "== $PASS passed, $FAIL failed =="
