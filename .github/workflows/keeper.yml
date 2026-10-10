@@ -24,6 +24,8 @@ on:
 permissions:
   actions: write
   contents: read
+  pages: write       # deploy the dashboard
+  id-token: write    # deploy-pages needs the OIDC token
 
 concurrency:
   group: keeper
@@ -66,3 +68,29 @@ jobs:
 
       - name: Ensure a watcher is running or queued
         run: bash .github/ensure-watcher.sh
+
+      # The dashboard renders the two files the watcher already publishes
+      # (status.json, changes.json) into one self-contained page. It rides the
+      # keeper rather than a cron of its own: the keeper is the job that fires
+      # every few minutes whatever happens to the watcher, so the page's
+      # freshness follows the state's freshness without another schedule to
+      # keep alive.
+      - name: Fetch the latest published state
+        run: |
+          mkdir -p .state dist
+          for f in status.json changes.json; do
+            gh api "repos/$GH_REPO/contents/$f?ref=state" --jq .content 2>/dev/null \
+              | base64 -d > ".state/$f" || echo "no $f yet"
+          done
+
+      - name: Build the dashboard
+        run: python3 dashboard.py --state-dir .state --out dist/index.html
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - uses: actions/deploy-pages@v4
+        id: deployment

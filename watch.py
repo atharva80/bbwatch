@@ -67,6 +67,11 @@ UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chr
 STATE_DIR = os.environ.get("STATE_DIR", ".state")
 STATE_FILE = os.path.join(STATE_DIR, "state.json.gz")
 STATUS_FILE = os.path.join(STATE_DIR, "status.json")
+# Rolling change log for the dashboard, published alongside status.json by
+# sync-state.sh. Presentation data only: the push dedup lives in state.json.gz,
+# so a lost or corrupt log costs a dashboard row, never a notification.
+CHANGES_FILE = os.path.join(STATE_DIR, "changes.json")
+CHANGES_KEEP = 400
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 DRY_RUN = bool(os.environ.get("DRY_RUN"))
 MIN_PRIORITY = int(os.environ.get("MIN_PRIORITY", "2"))
@@ -1207,6 +1212,47 @@ def to_push(e):
     return m
 
 
+def record_changes(events):
+    """Append this cycle's events to the rolling change log.
+
+    Best-effort by design: the watcher's job is to notify, and a dashboard that
+    fails to record must never take the notification path down with it. Entries
+    are deduplicated by the same hash the push path uses, so a replayed poll
+    (restored older state) does not double-log.
+    """
+    try:
+        doc = {"generated": None, "entries": []}
+        if os.path.exists(CHANGES_FILE):
+            with open(CHANGES_FILE) as f:
+                doc = json.load(f)
+        entries = doc.get("entries") or []
+        seen = {e.get("id") for e in entries}
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for e in events:
+            eid = hashlib.sha1(f"{e['title']}\n{e['body']}".encode()).hexdigest()[:16]
+            if eid in seen:
+                continue
+            seen.add(eid)
+            entries.insert(0, {
+                "id": eid,
+                "ts": stamp,
+                "kind": e.get("kind"),
+                "prio": e.get("prio"),
+                "tag": e.get("tag"),
+                "url": e.get("url"),
+                "title": e.get("title"),
+                "body": (e.get("body") or "")[:600],
+            })
+        doc["entries"] = entries[:CHANGES_KEEP]
+        doc["generated"] = stamp
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(CHANGES_FILE + ".tmp", "w") as f:
+            json.dump(doc, f, ensure_ascii=False)
+        os.replace(CHANGES_FILE + ".tmp", CHANGES_FILE)
+    except Exception as e:  # never fatal
+        log(f"change log write failed: {e}")
+
+
 def deliver(state, events):
     now = int(time.time())
     sent = {k: v for k, v in (state.get("sent") or {}).items() if now - v < DEDUP_FOR}
@@ -1233,6 +1279,7 @@ def deliver(state, events):
                 log(f"ntfy publish failed: {e}")
         keep.append(m)
     state["outbox"] = keep[-100:]
+    record_changes(events)
     return len(fresh)
 
 
