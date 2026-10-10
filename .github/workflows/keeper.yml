@@ -79,8 +79,13 @@ jobs:
         run: |
           mkdir -p .state dist
           for f in status.json changes.json; do
-            gh api "repos/$GH_REPO/contents/$f?ref=state" --jq .content 2>/dev/null \
-              | base64 -d > ".state/$f" || echo "no $f yet"
+            if gh api "repos/$GH_REPO/contents/$f?ref=state" --jq .content 2>/dev/null \
+                 | base64 -d > ".state/$f.tmp" && jq -e . ".state/$f.tmp" >/dev/null 2>&1; then
+              mv ".state/$f.tmp" ".state/$f"
+            else
+              rm -f ".state/$f.tmp"
+              echo "no usable $f yet"
+            fi
           done
 
       - name: Build the dashboard

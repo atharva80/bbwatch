@@ -54,13 +54,21 @@ def load(state_dir, do_fetch):
             except Exception as exc:
                 print(f"! {name}: {exc}")
     else:
-        for name, target in (("status.json", "status"), ("changes.json", "changes")):
+        # Missing or corrupt state is a dashboard with less on it, never a
+        # failed build: the deployed keeper step once died on a file that held
+        # the fallback echo of an absent changes.json instead of JSON.
+        for name in ("status.json", "changes.json"):
             path = os.path.join(state_dir, name)
             if not os.path.exists(path):
+                print(f"! {name}: not present, skipping")
                 continue
-            with open(path) as f:
-                data = json.load(f)
-            if target == "status":
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+            except Exception as exc:
+                print(f"! {name}: unusable ({exc}), skipping")
+                continue
+            if name == "status.json":
                 status = data
             else:
                 changes = data
