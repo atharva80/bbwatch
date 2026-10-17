@@ -197,7 +197,7 @@ def _num(v):
 #           or None when the scope is not known (never diffed, never erases)
 
 def program(name, url, state, bounty, max_=None, sig=None, assets=None, tags=None, ref=None,
-            contest=False, window=None):
+            contest=False, window=None, date=None):
     p = {"name": " ".join(str(name or "?").split()), "url": url, "state": state, "bounty": bool(bounty),
          "max": max_, "sig": sig, "assets": assets}
     if tags:
@@ -208,6 +208,8 @@ def program(name, url, state, bounty, max_=None, sig=None, assets=None, tags=Non
         p["contest"] = True
     if window:
         p["when"] = window  # shown in messages, never diffed
+    if date:
+        p["date"] = date  # the platform's own launch/updated date; presentation only, never diffed
     return p
 
 
@@ -255,6 +257,8 @@ class Source:
         want = {k for k in self.take_force() if k in progs}
         for k, p in progs.items():
             o = prev.get(k)
+            if o is not None and not p.get("date") and o.get("date"):
+                p["date"] = o["date"]  # a date set by a rotated detail fetch survives polls that skip it
             if o is not None and p["assets"] is None:
                 p["assets"] = o.get("assets")
                 if "ver" in o:
@@ -305,7 +309,7 @@ class HackerOne(Source):
     total_count
     pageInfo { endCursor hasNextPage }
     nodes {
-      handle name offers_bounties submission_state
+      handle name offers_bounties submission_state started_accepting_at
       structured_scopes(first: 100, archived: false) { total_count pageInfo { hasNextPage } nodes { %s } }
     }
   }
@@ -393,7 +397,8 @@ class HackerOne(Source):
                               s["eligible_for_bounty"], s["max_severity"])
             state = {"disabled": "closed"}.get(n["submission_state"], n["submission_state"])
             out[n["handle"]] = program(n["name"], f"https://hackerone.com/{n['handle']}", state,
-                                       n["offers_bounties"], sig=ss["total_count"], assets=assets)
+                                       n["offers_bounties"], sig=ss["total_count"], assets=assets,
+                                       date=n.get("started_accepting_at"))
         if len(out) < 0.9 * total:
             raise RuntimeError(f"partial listing: {len(out)}/{total}")
         return out
@@ -454,6 +459,8 @@ class Bugcrowd(Source):
                 add_asset(assets, t.get("uri") or t.get("name") or t.get("ipAddress"), t.get("category"),
                           in_scope, paid)
         p["assets"], p["ver"] = assets, latest["id"]
+        if latest.get("publishedAt"):
+            p["date"] = latest["publishedAt"]  # scope last published — Bugcrowd's only per-program date
 
 
 class Intigriti(Source):
@@ -620,7 +627,8 @@ class Cantina(Source):
                 out[b["id"]] = program(
                     b.get("name") or (b.get("company") or {}).get("name"), b.get("url"), state, pot > 0,
                     money(pot, b.get("currencyCode")) if pot else None, assets=assets, tags=tags,
-                    contest=contest, window=when(t.get("start"), t.get("end")) if contest else None)
+                    contest=contest, window=when(t.get("start"), t.get("end")) if contest else None,
+                    date=t.get("start"))
         return out
 
 
@@ -730,7 +738,7 @@ class Code4rena(Source):
             out[a["uid"]] = program(
                 a.get("title") or (a.get("org") or {}).get("name"), f"https://code4rena.com/audits/{a['slug']}", st,
                 _num(amt.split(" in ")[0]) > 0, amt.split(" in ")[0] or None, assets=assets, tags=tags, contest=True,
-                window=when(a.get("startTime"), a.get("endTime")))
+                window=when(a.get("startTime"), a.get("endTime")), date=a.get("startTime"))
         return out
 
 
@@ -754,7 +762,7 @@ class CodeHawks(Source):
                     c.get("name"), f"https://codehawks.cyfrin.io/c/{c.get('urlSlug')}",
                     contest_state(c.get("startDate"), c.get("endDate"), bool(c.get("finalised"))), pot > 0, prize,
                     assets={f"source_code|{c['githubUrl']}": [True, pot > 0, None]} if c.get("githubUrl") else None,
-                    tags=tags, contest=True, window=when(c.get("startDate"), c.get("endDate")))
+                    tags=tags, contest=True, window=when(c.get("startDate"), c.get("endDate")), date=c.get("startDate"))
         return out
 
 
@@ -806,7 +814,8 @@ class IssueHunt(Source):
                 org = (r.get("organization") or {}).get("name")
                 out[r["id"]] = program(org or r.get("name"), f"https://issuehunt.io/programs/{r.get('slug') or r['id']}",
                                        state, paid and mx > 0, money(mx, "JPY") if mx else None, assets=assets,
-                                       tags=["application"] if r.get("visibility") == "application" else None)
+                                       tags=["application"] if r.get("visibility") == "application" else None,
+                                       date=r.get("firstActivated"))
             if len(rows) < int(d.get("perPage") or 100):
                 return out
             page += 1
@@ -851,7 +860,7 @@ class BugBase(Source):
                 r.get("programName"), f"https://bugbase.ai/programs/{r['programUsername']}",
                 "open" if r.get("isAcceptingBugs") else "paused", paid, money(mx) if paid else None,
                 sig=hashlib.sha1(json.dumps([r.get("scopeGroups"), r.get("bountyVals")], sort_keys=True,
-                                            default=str).encode()).hexdigest()[:12])
+                                            default=str).encode()).hexdigest()[:12], date=r.get("createdAt"))
         return out
 
     def detail(self, key, p):
@@ -882,7 +891,8 @@ class Huntr(Source):
             pot = _num(c.get("total_prize_amount"))
             out[c["id"]] = program(c.get("title"), f"https://huntr.com/challenges/{c['id']}/v1/rules",
                                    {"closed": "ended"}.get(stage, stage), pot > 0, money(pot) if pot else None,
-                                   contest=True, window=when(c.get("start_date"), c.get("end_date")))
+                                   contest=True, window=when(c.get("start_date"), c.get("end_date")),
+                                   date=c.get("start_date"))
         if not out:
             raise RuntimeError("no challenges parsed from the RSC payload (page format changed?)")
         return out

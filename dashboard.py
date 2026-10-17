@@ -152,10 +152,14 @@ def to_dt(v):
         if isinstance(v, (int, float)):
             return dt.datetime.fromtimestamp(v / 1000 if v > 1e12 else v, dt.timezone.utc)
         s = str(v).strip()
-        try:
-            d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
-        except ValueError:
-            d = dt.datetime.strptime(s, "%d %b %Y")
+        if "GMT" in s:                       # JS Date.toString(), e.g. "Mon Mar 11 2024 01:36:34 GMT+0000 (…)"
+            s = s.split(" GMT", 1)[0]
+            d = dt.datetime.strptime(s, "%a %b %d %Y %H:%M:%S")
+        else:
+            try:
+                d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except ValueError:
+                d = dt.datetime.strptime(s, "%d %b %Y")
         return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
     except (ValueError, OverflowError, OSError):
         return None
@@ -183,12 +187,13 @@ def _date_of(val):
 
 
 def prog_dates(r):
-    """Resolve a program's freshness signals -> dict with the three source dates, the freshest
-    one (d/ds) and its kind (dk), and flags np (new program) / ns (new scope)."""
-    np_ts, _ = _date_of(r.get("first_seen"))      # when bbwatch first saw the program
-    ns_ts, _ = _date_of(r.get("scope_changed"))   # when bbwatch last saw its scope grow
-    pl_ts, _ = _date_of(r.get("sig"))             # the platform's own last-updated date
-    d_ts, dk = max((np_ts, "new"), (ns_ts, "scope"), (pl_ts, "upd"), key=lambda x: x[0])
+    """Resolve a program's freshness signals -> dict with the freshest date (d/ds) and its kind (dk):
+    new (bbwatch first saw the program) / scope (bbwatch saw scope grow) / date (the platform's own
+    launch or updated date, from the `date` field or the `sig`)."""
+    np_ts, _ = _date_of(r.get("first_seen"))      # bbwatch first saw the program
+    ns_ts, _ = _date_of(r.get("scope_changed"))   # bbwatch last saw its scope grow
+    pd_ts = max(_date_of(r.get("date"))[0], _date_of(r.get("sig"))[0])  # platform's own date
+    d_ts, dk = max((np_ts, "new"), (ns_ts, "scope"), (pd_ts, "date"), key=lambda x: x[0])
     d_str = dt.datetime.fromtimestamp(d_ts, dt.timezone.utc).strftime("%Y-%m-%d") if d_ts else ""
     return {"d": d_ts, "ds": d_str, "dk": dk, "np": 1 if np_ts else 0, "ns": 1 if ns_ts else 0}
 
@@ -540,7 +545,7 @@ function renderCat(){
     (r.t || []).slice(0,3).forEach(t => tags.push('<span class="t">' + esc(t) + '</span>'));
     if (r.ds){
       const DK = {new:['🆕 new ','first seen by bbwatch'], scope:['🔭 scope ','scope grew (seen by bbwatch)'],
-                  upd:['upd ','platform last-updated date']}[r.dk] || ['', ''];
+                  date:['📅 ','the platform\'s own launch / updated date']}[r.dk] || ['', ''];
       tags.push('<span class="t date dk-' + r.dk + '" title="' + DK[1] + '">' + DK[0] + esc(r.ds) + '</span>');
     }
     const parts = [];
