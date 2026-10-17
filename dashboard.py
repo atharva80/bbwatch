@@ -393,21 +393,23 @@ _TEMPLATE = r"""<!doctype html>
     <select id="cstate">
       <option value="live">live (open · active · judging)</option>
       <option value="open">open only</option>
-      <option value="">any state</option>
+      <option value="">any status</option>
       <option value="ended">ended / past</option>
     </select>
+    <select id="cwindow" title="filters by a program's newest date — new listing, scope change, or platform update">
+      <option value="0">added/updated: any time</option>
+      <option value="1">· last 24 hours</option>
+      <option value="7">· last 7 days</option>
+      <option value="30">· last 30 days</option>
+      <option value="90">· last 90 days</option>
+    </select>
     <select id="csort">
-      <option value="d">sort: latest added</option>
-      <option value="mv">sort: max bounty</option>
-      <option value="n">sort: name</option>
-      <option value="p">sort: platform</option>
+      <option value="d">sort: newest first</option>
+      <option value="mv">sort: biggest bounty</option>
+      <option value="n">sort: name A–Z</option>
     </select>
     <label class="tg"><input type="checkbox" id="cpay">paying only</label>
-    <label class="tg"><input type="checkbox" id="cw3">web3 / smart&nbsp;contract</label>
-    <span class="fresh">fresh surface:
-      <label class="tg"><input type="checkbox" id="cnew">🆕 new program</label>
-      <label class="tg"><input type="checkbox" id="cscope">🔭 new scope</label>
-    </span>
+    <label class="tg"><input type="checkbox" id="cw3">web3 / smart contract</label>
     <span class="count" id="ccount"></span>
   </div>
   <div class="grid" id="cat"></div>
@@ -478,7 +480,7 @@ const CAT = DATA.catalog || [];
 const cq = document.getElementById('cq'), cplat = document.getElementById('cplat'),
       cstate = document.getElementById('cstate'), csort = document.getElementById('csort'),
       cpay = document.getElementById('cpay'), cw3 = document.getElementById('cw3'),
-      cnew = document.getElementById('cnew'), cscope = document.getElementById('cscope'),
+      cwindow = document.getElementById('cwindow'),
       catEl = document.getElementById('cat'), ccount = document.getElementById('ccount');
 
 const platCounts = {};
@@ -495,7 +497,8 @@ function renderCat(){
   const words = needle ? needle.split(/\s+/) : [];
   const plat = cplat.value, st = cstate.value, sort = csort.value;
   const payOnly = cpay.checked, w3Only = cw3.checked;
-  const fNew = cnew.checked, fScope = cscope.checked;
+  const winDays = parseInt(cwindow.value || '0', 10);
+  const cutoff = winDays ? (Date.now()/1000 - winDays*86400) : 0;
   let rows = CAT.filter(r => {
     if (plat && r.p !== plat) return false;
     if (st === 'live' && !LIVE[r.s]) return false;
@@ -503,8 +506,8 @@ function renderCat(){
     else if (st === 'ended' && LIVE[r.s]) return false;
     if (payOnly && !r.b) return false;
     if (w3Only && !r.w3) return false;
-    // fresh surface: union of the selected kinds (new program and/or new scope)
-    if ((fNew || fScope) && !((fNew && r.np) || (fScope && r.ns))) return false;
+    // fresh surface: newest date (new listing / scope change / platform update) within the window
+    if (cutoff && !(r.d && r.d >= cutoff)) return false;
     if (words.length){
       const hay = (r.n + ' ' + r.u + ' ' + r.p + ' ' + (r.t||[]).join(' ')
         + ' ' + (r.sc||[]).join(' ')).toLowerCase();
@@ -513,7 +516,6 @@ function renderCat(){
     return true;
   });
   if (sort === 'n') rows.sort((a,b) => a.n.toLowerCase().localeCompare(b.n.toLowerCase()));
-  else if (sort === 'p') rows.sort((a,b) => (a.p+a.n).localeCompare(b.p+b.n));
   else if (sort === 'mv') rows.sort((a,b) => b.mv - a.mv || a.n.toLowerCase().localeCompare(b.n.toLowerCase()));
   else rows.sort((a,b) => b.d - a.d || b.mv - a.mv || a.n.toLowerCase().localeCompare(b.n.toLowerCase()));
 
@@ -564,7 +566,7 @@ function renderCat(){
     catEl.appendChild(more);
   }
 }
-[cq, cplat, cstate, csort, cpay, cw3, cnew, cscope].forEach(el =>
+[cq, cplat, cstate, cwindow, csort, cpay, cw3].forEach(el =>
   el.addEventListener(el.type === 'checkbox' || el.tagName === 'SELECT' ? 'change' : 'input', renderCat));
 renderCat();
 
