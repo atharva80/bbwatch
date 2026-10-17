@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """Build bbwatch's dashboard as one self-contained HTML file.
 
-Reads the two files the watcher publishes to the `state` branch — status.json
-(source health, last sync) and changes.json (the rolling change log) — and
-renders them into a single page with no external requests, so it works from
-GitHub Pages, from a local file, or from a phone.
+Two views, both rendered from the files the watcher publishes to the `state`
+branch, embedded inline so the page makes no external request (works from
+GitHub Pages, a local file, or a phone):
+
+  * Bounties — the full browsable catalog of every program the watcher tracks,
+    flattened from state.json.gz, with filters (search, platform, state,
+    paying-only, web3/smart-contract, sort by max bounty). This is the default.
+  * Changes — the rolling change feed (changes.json): the watcher's own events,
+    newest first.
+
+Source health (status.json) heads both.
 
     python3 dashboard.py --state-dir .state --out dist/index.html
     python3 dashboard.py --fetch --out dist/index.html     # pull from state branch
-
-The page carries a filter box and kind/priority controls that run in the
-browser; nothing on it talks to a server, so there is nothing to keep alive
-beyond the watcher that produces the JSON.
 """
 import argparse
 import datetime as dt
+import gzip
 import json
 import os
+import re
 import urllib.request
 
 STATE_RAW = "https://raw.githubusercontent.com/atharva80/bbwatch/state"
@@ -33,6 +38,12 @@ KIND_CLASS = {"NEW": "new", "SCOPE": "scope", "SCOPE_GROW": "scope", "META": "me
               "HEALTH": "health", "ARMED": "health"}
 PRIO_CLASS = {5: "p5", 4: "p4", 3: "p3", 2: "p2", 1: "p1"}
 
+# Which asset types mark a program as "web3 / smart-contract" surface.
+WEB3_TYPES = {"smart_contract", "source_code", "blockchain", "contract"}
+# States whose scope strings are dropped from the catalog to keep the page
+# small — these programs are over, so searching their repos is rarely useful.
+DEAD_STATES = {"ended", "closed", "suspended"}
+
 
 def fetch_json(url):
     req = urllib.request.Request(url, headers={"User-Agent": "bbwatch-dashboard"})
@@ -40,23 +51,30 @@ def fetch_json(url):
         return json.loads(r.read().decode())
 
 
+def fetch_bytes(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "bbwatch-dashboard"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return r.read()
+
+
 def load(state_dir, do_fetch):
-    status, changes = None, None
+    """Return (status, changes, state) — any of which may be None if missing or
+    corrupt. A gap means a lighter page, never a failed build."""
+    status = changes = state = None
     if do_fetch:
-        for name, url in (("status.json", f"{STATE_RAW}/status.json"),
-                          ("changes.json", f"{STATE_RAW}/changes.json")):
-            try:
-                data = fetch_json(url)
-                if name == "status.json":
-                    status = data
-                else:
-                    changes = data
-            except Exception as exc:
-                print(f"! {name}: {exc}")
+        try:
+            status = fetch_json(f"{STATE_RAW}/status.json")
+        except Exception as exc:
+            print(f"! status.json: {exc}")
+        try:
+            changes = fetch_json(f"{STATE_RAW}/changes.json")
+        except Exception as exc:
+            print(f"! changes.json: {exc}")
+        try:
+            state = json.loads(gzip.decompress(fetch_bytes(f"{STATE_RAW}/state.json.gz")))
+        except Exception as exc:
+            print(f"! state.json.gz: {exc}")
     else:
-        # Missing or corrupt state is a dashboard with less on it, never a
-        # failed build: the deployed keeper step once died on a file that held
-        # the fallback echo of an absent changes.json instead of JSON.
         for name in ("status.json", "changes.json"):
             path = os.path.join(state_dir, name)
             if not os.path.exists(path):
@@ -72,7 +90,16 @@ def load(state_dir, do_fetch):
                 status = data
             else:
                 changes = data
-    return status, changes
+        gz = os.path.join(state_dir, "state.json.gz")
+        if os.path.exists(gz):
+            try:
+                with open(gz, "rb") as f:
+                    state = json.loads(gzip.decompress(f.read()))
+            except Exception as exc:
+                print(f"! state.json.gz: unusable ({exc}), skipping")
+        else:
+            print("! state.json.gz: not present, skipping")
+    return status, changes, state
 
 
 def ago(stamp):
@@ -92,6 +119,30 @@ def ago(stamp):
     return f"{secs // 86400} d ago"
 
 
+def money(m):
+    """Best-effort numeric value of a bounty string for sorting ($, €, ¥, ₽…).
+
+    Takes the *first* number in the string (so "$55,000 USDC (plus $20,000)"
+    reads as 55000, not the two concatenated) and applies a k/m/million suffix.
+    """
+    if not m:
+        return 0
+    s = str(m)
+    mo = re.search(r"([0-9][0-9,]*)(\.[0-9]+)?\s*(k|m|million|mln)?", s, re.I)
+    if not mo:
+        return 0
+    try:
+        val = float(mo.group(1).replace(",", "") + (mo.group(2) or ""))
+    except ValueError:
+        return 0
+    suffix = (mo.group(3) or "").lower()
+    if suffix == "k":
+        val *= 1_000
+    elif suffix in ("m", "million", "mln"):
+        val *= 1_000_000
+    return int(val)
+
+
 def source_rows(status):
     rows = []
     for name, s in sorted(((status or {}).get("sources") or {}).items()):
@@ -101,13 +152,54 @@ def source_rows(status):
             "programs": s.get("programs"),
             "ok": not err,
             "error": err,
-            "age": ago(dt.datetime.fromtimestamp(s["ok_at"], dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-            if s.get("ok_at") else "",
         })
     return rows
 
 
-def render(status, changes, generated):
+def build_catalog(state):
+    """Flatten every source's programs into one trimmed, searchable list."""
+    cat = []
+    for plat, s in sorted(((state or {}).get("sources") or {}).items()):
+        if plat == "mirror" or not isinstance(s, dict):
+            continue
+        for _pid, r in (s.get("programs") or {}).items():
+            if not isinstance(r, dict):
+                continue
+            assets = r.get("assets") or {}
+            types, scopes = set(), []
+            for key in assets:
+                head, _, ident = str(key).partition("|")
+                types.add(head)
+                if ident:
+                    scopes.append(ident)
+            st = r.get("state") or ""
+            is_web3 = bool(types & WEB3_TYPES) or any(
+                t.lower() in ("smart contract", "web3", "blockchain", "defi")
+                for t in (r.get("tags") or []))
+            cat.append({
+                "p": plat,
+                "n": r.get("name") or "",
+                "u": r.get("url") or "",
+                "m": r.get("max") or "",
+                "mv": money(r.get("max")),
+                "b": 1 if r.get("bounty") else 0,
+                "s": st,
+                "t": r.get("tags") or [],
+                "c": 1 if r.get("contest") else 0,
+                "w": r.get("when") or "",
+                "na": len(assets),
+                "ty": sorted(types),
+                "w3": 1 if is_web3 else 0,
+                # scope idents kept only for live programs, capped, to bound size
+                "sc": [] if st in DEAD_STATES else scopes[:8],
+            })
+    # paying + live first, then by bounty value, then name
+    live_rank = {"open": 0, "active": 0, "judging": 1, "paused": 2}
+    cat.sort(key=lambda r: (live_rank.get(r["s"], 3), -r["mv"], r["n"].lower()))
+    return cat
+
+
+def render(status, changes, catalog, generated):
     entries = (changes or {}).get("entries") or []
     feed = []
     for e in entries:
@@ -133,41 +225,75 @@ def render(status, changes, generated):
         "sources": source_rows(status),
         "outbox": (status or {}).get("outbox"),
         "feed": feed,
+        "catalog": catalog,
     }
-    data = json.dumps(payload, ensure_ascii=False)
-    return """<!doctype html>
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return _TEMPLATE.replace("__DATA__", data)
+
+
+_TEMPLATE = r"""<!doctype html>
 <html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>bbwatch — fresh bug-bounty surface</title>
+<title>bbwatch — bug-bounty surface</title>
 <style>
   :root{
     --bg:#0e1116; --panel:#151a21; --line:#232b36; --text:#e6edf3; --dim:#9aa7b4;
     --accent:#4c8dff; --p5:#3fb950; --p4:#d29922; --p3:#8b949e; --p2:#6e7681;
+    --chip:#1b222c;
   }
   @media (prefers-color-scheme: light){
-    :root{ --bg:#f6f8fa; --panel:#ffffff; --line:#d8dee4; --text:#1f2328; --dim:#59636e; }
+    :root{ --bg:#f6f8fa; --panel:#ffffff; --line:#d8dee4; --text:#1f2328; --dim:#59636e; --chip:#eef1f4; }
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--text);
     font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,"Helvetica Neue",sans-serif}
-  header{padding:26px 22px 14px;border-bottom:1px solid var(--line)}
-  .wrap{max-width:1000px;margin:0 auto}
+  header{padding:22px 16px 12px;border-bottom:1px solid var(--line)}
+  .wrap{max-width:1100px;margin:0 auto}
   h1{margin:0;font-size:20px;letter-spacing:-.01em}
   h1 span{color:var(--dim);font-weight:400}
   .meta{margin-top:6px;color:var(--dim);font-size:13px}
   .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--p5);margin-right:6px;vertical-align:1px}
   .dot.stale{background:var(--p4)}
-  section{padding:18px 22px}
   .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
   .chip{border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:12px;color:var(--dim);background:var(--panel)}
   .chip b{color:var(--text);font-weight:600}
   .chip.bad{border-color:#7d2d2d;color:#ff9c9c}
+  .tabs{display:flex;gap:4px;margin-top:14px}
+  .tab{border:1px solid var(--line);border-bottom:none;background:transparent;color:var(--dim);
+    border-radius:8px 8px 0 0;padding:8px 16px;font-size:14px;cursor:pointer}
+  .tab.on{background:var(--panel);color:var(--text);font-weight:600}
+  section{padding:16px}
   .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 14px}
   input[type=search],select{background:var(--panel);border:1px solid var(--line);color:var(--text);
-    border-radius:8px;padding:7px 10px;font-size:14px;min-width:220px}
-  select{min-width:0}
+    border-radius:8px;padding:8px 10px;font-size:14px}
+  input[type=search]{flex:1 1 240px;min-width:0}
+  label.tg{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--dim);
+    border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:7px 10px;cursor:pointer}
+  label.tg input{accent-color:var(--accent)}
+  .count{color:var(--dim);font-size:13px;margin-left:auto;white-space:nowrap}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px}
+  .b{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:12px 14px;
+    display:flex;flex-direction:column;gap:7px}
+  .b.dead{opacity:.6}
+  .b .top{display:flex;gap:8px;align-items:baseline}
+  .b .nm{font-weight:600;line-height:1.3}
+  .b .nm a{color:var(--text)} .b .nm a:hover{color:var(--accent)}
+  .b .pay{margin-left:auto;font-weight:700;color:var(--p5);white-space:nowrap;font-size:14px}
+  .b .pay.none{color:var(--dim);font-weight:400}
+  .tagrow{display:flex;flex-wrap:wrap;gap:5px}
+  .t{font-size:11px;border-radius:5px;padding:2px 7px;border:1px solid var(--line);color:var(--dim);background:var(--chip)}
+  .t.plat{color:var(--accent);border-color:var(--accent)}
+  .t.w3{color:#d2a8ff;border-color:#4a3766}
+  .t.st-open,.t.st-active{color:#7ee787;border-color:#2b5a34}
+  .t.st-judging{color:#79c0ff;border-color:#264a72}
+  .t.st-paused,.t.st-suspended{color:#d29922;border-color:#6b5420}
+  .t.st-ended,.t.st-closed{color:var(--dim)}
+  .b .sc{color:var(--dim);font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
   .card{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:12px 14px;margin:10px 0}
   .card.health{opacity:.75}
   .row{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
@@ -184,19 +310,45 @@ def render(status, changes, generated):
   a{color:var(--accent);text-decoration:none}
   a:hover{text-decoration:underline}
   .empty{color:var(--dim);border:1px dashed var(--line);border-radius:10px;padding:18px;text-align:center}
-  footer{padding:8px 22px 30px;color:var(--dim);font-size:12px}
-  .count{color:var(--dim);font-size:13px;margin-left:auto}
+  footer{padding:10px 16px 30px;color:var(--dim);font-size:12px}
+  .hide{display:none}
 </style>
 </head>
 <body>
 <header><div class="wrap">
-  <h1>bbwatch <span>· fresh bug-bounty surface</span></h1>
+  <h1>bbwatch <span>· bug-bounty surface</span></h1>
   <div class="meta"><span id="liveness" class="dot"></span><span id="liveness-text"></span>
-    · source data <span id="updated"></span> · page built <span id="generated"></span></div>
+    · source data <span id="updated"></span> · built <span id="generated"></span></div>
   <div class="chips" id="sources"></div>
+  <div class="tabs">
+    <button class="tab on" id="tab-cat" data-view="cat">Bounties</button>
+    <button class="tab" id="tab-feed" data-view="feed">Changes</button>
+  </div>
 </div></header>
 
-<section class="wrap">
+<section class="wrap" id="view-cat">
+  <div class="controls">
+    <input type="search" id="cq" placeholder="search name, url, scope repo, tag…">
+    <select id="cplat"><option value="">all platforms</option></select>
+    <select id="cstate">
+      <option value="live">live (open · active · judging)</option>
+      <option value="open">open only</option>
+      <option value="">any state</option>
+      <option value="ended">ended / past</option>
+    </select>
+    <select id="csort">
+      <option value="mv">sort: max bounty</option>
+      <option value="n">sort: name</option>
+      <option value="p">sort: platform</option>
+    </select>
+    <label class="tg"><input type="checkbox" id="cpay">paying only</label>
+    <label class="tg"><input type="checkbox" id="cw3">web3 / smart&nbsp;contract</label>
+    <span class="count" id="ccount"></span>
+  </div>
+  <div class="grid" id="cat"></div>
+</section>
+
+<section class="wrap hide" id="view-feed">
   <div class="controls">
     <input type="search" id="q" placeholder="filter changes: program, kind, domain…">
     <select id="kind">
@@ -216,17 +368,14 @@ def render(status, changes, generated):
   </div>
   <div id="feed"></div>
 </section>
-<footer class="wrap">Changes are the watcher's own events, newest first. Click a card's
-program link to open it on the platform. Nothing here is filtered for you:
-a scope change on a program you cannot submit to is still a scope change.</footer>
+
+<footer class="wrap">Catalog is every program the watcher tracks, newest snapshot.
+Changes are its own events, newest first. Nothing is filtered for eligibility:
+a program you cannot submit to is still listed. Max-bounty values mix currencies
+and are approximate — they are what the platform advertises.</footer>
 
 <script>
 const DATA = __DATA__;
-const feed = document.getElementById('feed');
-const q = document.getElementById('q');
-const kind = document.getElementById('kind');
-const prio = document.getElementById('prio');
-const count = document.getElementById('count');
 
 document.getElementById('updated').textContent = DATA.updated || 'unknown';
 document.getElementById('generated').textContent = (DATA.generated || '').replace('T',' ').replace('Z',' UTC');
@@ -243,14 +392,110 @@ const sources = document.getElementById('sources');
 (DATA.sources || []).forEach(s => {
   const div = document.createElement('span');
   div.className = 'chip' + (s.ok ? '' : ' bad');
-  div.innerHTML = '<b>' + s.name + '</b> · ' + (s.programs ?? '?') + ' programs'
-    + (s.ok ? '' : ' · ' + (s.error || 'error'));
+  div.innerHTML = '<b>' + esc(s.name) + '</b> · ' + (s.programs ?? '?')
+    + (s.ok ? '' : ' · ' + esc(s.error || 'error'));
   sources.appendChild(div);
 });
 
-function esc(t){ const d = document.createElement('div'); d.textContent = t || ''; return d.innerHTML; }
+function esc(t){ const d = document.createElement('div'); d.textContent = t == null ? '' : t; return d.innerHTML; }
 
-function render(){
+/* ---- tabs ---- */
+document.querySelectorAll('.tab').forEach(btn => btn.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(b => b.classList.remove('on'));
+  btn.classList.add('on');
+  const v = btn.dataset.view;
+  document.getElementById('view-cat').classList.toggle('hide', v !== 'cat');
+  document.getElementById('view-feed').classList.toggle('hide', v !== 'feed');
+}));
+
+/* ---- catalog ---- */
+const CAT = DATA.catalog || [];
+const cq = document.getElementById('cq'), cplat = document.getElementById('cplat'),
+      cstate = document.getElementById('cstate'), csort = document.getElementById('csort'),
+      cpay = document.getElementById('cpay'), cw3 = document.getElementById('cw3'),
+      catEl = document.getElementById('cat'), ccount = document.getElementById('ccount');
+
+const platCounts = {};
+CAT.forEach(r => { platCounts[r.p] = (platCounts[r.p] || 0) + 1; });
+Object.keys(platCounts).sort().forEach(p => {
+  const o = document.createElement('option');
+  o.value = p; o.textContent = p + ' (' + platCounts[p] + ')';
+  cplat.appendChild(o);
+});
+
+const LIVE = {open:1, active:1, judging:1};
+function renderCat(){
+  const needle = (cq.value || '').toLowerCase().trim();
+  const words = needle ? needle.split(/\s+/) : [];
+  const plat = cplat.value, st = cstate.value, sort = csort.value;
+  const payOnly = cpay.checked, w3Only = cw3.checked;
+  let rows = CAT.filter(r => {
+    if (plat && r.p !== plat) return false;
+    if (st === 'live' && !LIVE[r.s]) return false;
+    else if (st === 'open' && r.s !== 'open') return false;
+    else if (st === 'ended' && LIVE[r.s]) return false;
+    if (payOnly && !r.b) return false;
+    if (w3Only && !r.w3) return false;
+    if (words.length){
+      const hay = (r.n + ' ' + r.u + ' ' + r.p + ' ' + (r.t||[]).join(' ')
+        + ' ' + (r.sc||[]).join(' ')).toLowerCase();
+      if (!words.every(w => hay.includes(w))) return false;
+    }
+    return true;
+  });
+  if (sort === 'n') rows.sort((a,b) => a.n.toLowerCase().localeCompare(b.n.toLowerCase()));
+  else if (sort === 'p') rows.sort((a,b) => (a.p+a.n).localeCompare(b.p+b.n));
+  else rows.sort((a,b) => b.mv - a.mv || a.n.toLowerCase().localeCompare(b.n.toLowerCase()));
+
+  ccount.textContent = rows.length.toLocaleString() + ' of ' + CAT.length.toLocaleString() + ' programs';
+  catEl.innerHTML = '';
+  if (!rows.length){
+    catEl.innerHTML = '<div class="empty">' + (CAT.length
+      ? 'no program matches these filters'
+      : 'catalog not available — the watcher snapshot has not been published yet') + '</div>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  const dead = {ended:1, closed:1, suspended:1};
+  for (const r of rows.slice(0, 600)){
+    const card = document.createElement('div');
+    card.className = 'b' + (dead[r.s] ? ' dead' : '');
+    const tags = [];
+    tags.push('<span class="t plat">' + esc(r.p) + '</span>');
+    if (r.s) tags.push('<span class="t st-' + esc(r.s) + '">' + esc(r.s) + '</span>');
+    if (r.c) tags.push('<span class="t">contest</span>');
+    if (r.w3) tags.push('<span class="t w3">web3</span>');
+    (r.t || []).slice(0,3).forEach(t => tags.push('<span class="t">' + esc(t) + '</span>'));
+    const scope = (r.na ? r.na + ' asset' + (r.na>1?'s':'') : '')
+      + (r.sc && r.sc.length ? ' · ' + esc(r.sc.slice(0,2).join(', ')) : '')
+      + (r.w ? ' · ' + esc(r.w) : '');
+    card.innerHTML =
+      '<div class="top"><span class="nm">' + (r.u
+          ? '<a href="' + encodeURI(r.u) + '" rel="noopener" target="_blank">' + esc(r.n) + '</a>'
+          : esc(r.n)) + '</span>'
+        + '<span class="pay' + (r.b && r.mv ? '' : ' none') + '">'
+          + (r.m ? esc(r.m) : (r.b ? 'paid' : 'VDP')) + '</span></div>'
+      + '<div class="tagrow">' + tags.join('') + '</div>'
+      + (scope ? '<div class="sc">' + scope + '</div>' : '');
+    frag.appendChild(card);
+  }
+  catEl.appendChild(frag);
+  if (rows.length > 600){
+    const more = document.createElement('div');
+    more.className = 'empty';
+    more.textContent = 'showing the first 600 — narrow the filters to see the rest';
+    catEl.appendChild(more);
+  }
+}
+[cq, cplat, cstate, csort, cpay, cw3].forEach(el =>
+  el.addEventListener(el.type === 'checkbox' || el.tagName === 'SELECT' ? 'change' : 'input', renderCat));
+renderCat();
+
+/* ---- change feed ---- */
+const feed = document.getElementById('feed'), q = document.getElementById('q'),
+      kind = document.getElementById('kind'), prio = document.getElementById('prio'),
+      count = document.getElementById('count');
+function renderFeed(){
   const needle = (q.value || '').toLowerCase().trim();
   const k = kind.value, p = parseInt(prio.value || '0', 10);
   const rows = (DATA.feed || []).filter(e => {
@@ -276,32 +521,34 @@ function render(){
       + '<span class="title">' + esc(e.title) + '</span>'
       + '<span class="time" title="' + esc(e.ts) + '">' + esc(e.ago || e.ts) + '</span></div>'
       + (e.body ? '<pre>' + esc(e.body) + '</pre>' : '')
-      + (e.url ? '<div style="margin-top:8px"><a href="' + e.url + '" rel="noopener">open program →</a></div>' : '');
+      + (e.url ? '<div style="margin-top:8px"><a href="' + encodeURI(e.url) + '" rel="noopener" target="_blank">open program →</a></div>' : '');
     feed.appendChild(card);
   }
 }
-q.addEventListener('input', render);
-kind.addEventListener('change', render);
-prio.addEventListener('change', render);
-render();
+q.addEventListener('input', renderFeed);
+kind.addEventListener('change', renderFeed);
+prio.addEventListener('change', renderFeed);
+renderFeed();
 </script>
 </body></html>
-""".replace("__DATA__", data)
+"""
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--state-dir", default=".state")
     ap.add_argument("--out", default="dist/index.html")
-    ap.add_argument("--fetch", action="store_true", help="read status/changes from the state branch")
+    ap.add_argument("--fetch", action="store_true", help="read state from the state branch")
     args = ap.parse_args()
-    status, changes = load(args.state_dir, args.fetch)
+    status, changes, state = load(args.state_dir, args.fetch)
+    catalog = build_catalog(state)
     generated = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    html = render(status, changes, generated)
+    html = render(status, changes, catalog, generated)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
         f.write(html)
     print(f"wrote {args.out}: {len(html)} bytes, "
+          f"{len(catalog)} program(s), "
           f"{len((changes or {}).get('entries') or [])} change(s), "
           f"{len((status or {}).get('sources') or {})} source(s)")
 

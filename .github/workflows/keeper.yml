@@ -87,6 +87,18 @@ jobs:
               echo "no usable $f yet"
             fi
           done
+          # state.json.gz is the full program catalog (binary, ~0.7 MB and
+          # growing). Pull it as raw bytes — the contents API's base64 form caps
+          # at 1 MB — and keep it only if it is really gzip, so a bad fetch
+          # leaves the dashboard without a catalog rather than breaking the build.
+          if gh api -H "Accept: application/vnd.github.raw" \
+               "repos/$GH_REPO/contents/state.json.gz?ref=state" > .state/state.json.gz.tmp 2>/dev/null \
+             && gzip -t .state/state.json.gz.tmp 2>/dev/null; then
+            mv .state/state.json.gz.tmp .state/state.json.gz
+          else
+            rm -f .state/state.json.gz.tmp
+            echo "no usable state.json.gz yet"
+          fi
 
       - name: Build the dashboard
         run: python3 dashboard.py --state-dir .state --out dist/index.html

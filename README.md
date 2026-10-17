@@ -95,6 +95,25 @@ an always-on polling job is a grey area. The same script runs unchanged
 anywhere with Python 3.9+, e.g. an always-free VM with a systemd unit running
 `python3 watch.py --loop` (`NTFY_TOPIC` in an `EnvironmentFile`).
 
+## Dashboard
+
+A single self-contained page at **https://atharva80.github.io/bbwatch/**, rebuilt
+by the keeper every few minutes (so its freshness tracks the state's). Two views:
+
+- **Bounties** — the full catalog of every tracked program, flattened from
+  `state.json.gz`. Filter by text (name, URL, in-scope repo/asset, tag),
+  platform, state (defaults to live: open · active · judging), **paying-only**,
+  and **web3 / smart-contract**; sort by max bounty, name, or platform.
+- **Changes** — the rolling change feed (`changes.json`), newest first.
+
+`dashboard.py` embeds the data inline and makes no external request, so it works
+from Pages, a `file://` open, or a phone. Nothing is filtered for eligibility and
+max-bounty values mix currencies — they are what each platform advertises.
+
+```sh
+python3 dashboard.py --fetch --out dist/index.html   # build from the live state branch
+```
+
 ## Run locally
 
 ```sh
