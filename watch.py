@@ -1057,7 +1057,7 @@ def new_event(src, key, p):
     return event(src, p, "NEW", prio, f"new {'contest' if p.get('contest') else 'program'}", lines, "🆕")
 
 
-def diff_program(src, key, o, p):
+def diff_program(src, key, o, p, now_iso=None):
     kinds, lines = [], []
     live = p["state"] in LIVE
     oa, pa = o.get("assets"), p.get("assets")
@@ -1069,6 +1069,8 @@ def diff_program(src, key, o, p):
         sev = sorted(k for k in pa if k in oa and pa[k][0] and oa[k][0] and pa[k][2] != oa[k][2])
         gone = sorted(k for k in oa if oa[k][0] and not (k in pa and pa[k][0]))
         if fresh or now_paid:
+            if now_iso:
+                p["scope_changed"] = now_iso  # assets added/became eligible — the catalog's "new scope" date
             hot = any(paid(pa[k], p) for k in fresh + now_paid)
             what = plural(len(fresh), "new target") if fresh else plural(len(now_paid), "target") + " now paid"
             kinds.append(((4 if hot else 3) if live else 2, "SCOPE", what, "🔭"))
@@ -1108,6 +1110,7 @@ def gone_event(src, p):
 def diff_source(src, prev, new, book):
     """-> (state to keep, events). Absent programs are carried for GONE_AFTER polls."""
     events, merged = [], dict(new)
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     missing = book.setdefault("missing", {})
     for k in prev.keys() - new.keys():
         missing[k] = missing.get(k, 0) + 1
@@ -1120,11 +1123,16 @@ def diff_source(src, prev, new, book):
         missing.pop(k, None)
         o = prev.get(k)
         if o is None:
+            p["first_seen"] = now_iso  # when bbwatch first saw it — the catalog's "added" date
             events.append(new_event(src, k, p))
             continue
+        if o.get("first_seen"):  # a fresh poll record has none; carry the originals forward
+            p["first_seen"] = o["first_seen"]
+        if o.get("scope_changed"):
+            p["scope_changed"] = o["scope_changed"]
         if p.get("assets") is None and o.get("assets") is not None:  # unknown scope never erases a known one
             p["assets"] = o["assets"]
-        e = diff_program(src, k, o, p)
+        e = diff_program(src, k, o, p, now_iso)
         if e:
             events.append(e)
     return merged, events

@@ -143,6 +143,56 @@ def money(m):
     return int(val)
 
 
+def to_dt(v):
+    """ISO string, unix seconds/millis or "17 Nov 2025" -> aware datetime (None if unparseable).
+    Mirrors watch.py's parser so the dashboard reads the same date forms the watcher stores."""
+    if v in (None, ""):
+        return None
+    try:
+        if isinstance(v, (int, float)):
+            return dt.datetime.fromtimestamp(v / 1000 if v > 1e12 else v, dt.timezone.utc)
+        s = str(v).strip()
+        try:
+            d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            d = dt.datetime.strptime(s, "%d %b %Y")
+        return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+# A date must fall in this window to be believed — rejects garbage from sigs that
+# are really counts/prices (e.g. "8" parsing to 1970) rather than timestamps.
+_DATE_MIN = dt.datetime(2015, 1, 1, tzinfo=dt.timezone.utc)
+
+
+def _date_of(val):
+    """(unix_ts, 'YYYY-MM-DD') for one value, (0, '') if it is not a believable date.
+    Accepts ISO, a raw unix ts (intigriti/sherlock), or a "<date>|<extra>" sig (ywh/hackenproof)."""
+    hi = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=400)
+    if isinstance(val, (int, float)):
+        d = to_dt(val)
+    elif val not in (None, ""):
+        head = str(val).split("|", 1)[0]
+        d = to_dt(int(head) if head.isdigit() else head)
+    else:
+        d = None
+    if d and _DATE_MIN <= d <= hi:
+        return int(d.timestamp()), d.strftime("%Y-%m-%d")
+    return 0, ""
+
+
+def prog_dates(r):
+    """Resolve a program's freshness signals -> dict with the three source dates, the freshest
+    one (d/ds) and its kind (dk), and flags np (new program) / ns (new scope)."""
+    np_ts, _ = _date_of(r.get("first_seen"))      # when bbwatch first saw the program
+    ns_ts, _ = _date_of(r.get("scope_changed"))   # when bbwatch last saw its scope grow
+    pl_ts, _ = _date_of(r.get("sig"))             # the platform's own last-updated date
+    d_ts, dk = max((np_ts, "new"), (ns_ts, "scope"), (pl_ts, "upd"), key=lambda x: x[0])
+    d_str = dt.datetime.fromtimestamp(d_ts, dt.timezone.utc).strftime("%Y-%m-%d") if d_ts else ""
+    return {"d": d_ts, "ds": d_str, "dk": dk, "np": 1 if np_ts else 0, "ns": 1 if ns_ts else 0}
+
+
 def source_rows(status):
     rows = []
     for name, s in sorted(((status or {}).get("sources") or {}).items()):
@@ -176,6 +226,7 @@ def build_catalog(state):
             is_web3 = bool(types & WEB3_TYPES) or any(
                 t.lower() in ("smart contract", "web3", "blockchain", "defi")
                 for t in (r.get("tags") or []))
+            dd = prog_dates(r)
             cat.append({
                 "p": plat,
                 "n": r.get("name") or "",
@@ -190,6 +241,11 @@ def build_catalog(state):
                 "na": len(assets),
                 "ty": sorted(types),
                 "w3": 1 if is_web3 else 0,
+                "d": dd["d"],    # freshest signal, unix seconds (0 = unknown) — drives "latest" sort
+                "ds": dd["ds"],  # that date as YYYY-MM-DD
+                "dk": dd["dk"],  # which it is: new (program) / scope (grew) / upd (platform)
+                "np": dd["np"],  # 1 = bbwatch has recorded this as a new program
+                "ns": dd["ns"],  # 1 = bbwatch has recorded a scope addition on it
                 # scope idents kept only for live programs, capped, to bound size
                 "sc": [] if st in DEAD_STATES else scopes[:8],
             })
@@ -287,6 +343,10 @@ _TEMPLATE = r"""<!doctype html>
   .t{font-size:11px;border-radius:5px;padding:2px 7px;border:1px solid var(--line);color:var(--dim);background:var(--chip)}
   .t.plat{color:var(--accent);border-color:var(--accent)}
   .t.w3{color:#d2a8ff;border-color:#4a3766}
+  .t.date{color:var(--dim);border-color:var(--line);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .t.date.dk-new{color:#7ee787;border-color:#2b5a34}
+  .t.date.dk-scope{color:#79c0ff;border-color:#264a72}
+  .fresh{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--dim)}
   .t.st-open,.t.st-active{color:#7ee787;border-color:#2b5a34}
   .t.st-judging{color:#79c0ff;border-color:#264a72}
   .t.st-paused,.t.st-suspended{color:#d29922;border-color:#6b5420}
@@ -337,12 +397,17 @@ _TEMPLATE = r"""<!doctype html>
       <option value="ended">ended / past</option>
     </select>
     <select id="csort">
+      <option value="d">sort: latest added</option>
       <option value="mv">sort: max bounty</option>
       <option value="n">sort: name</option>
       <option value="p">sort: platform</option>
     </select>
     <label class="tg"><input type="checkbox" id="cpay">paying only</label>
     <label class="tg"><input type="checkbox" id="cw3">web3 / smart&nbsp;contract</label>
+    <span class="fresh">fresh surface:
+      <label class="tg"><input type="checkbox" id="cnew">🆕 new program</label>
+      <label class="tg"><input type="checkbox" id="cscope">🔭 new scope</label>
+    </span>
     <span class="count" id="ccount"></span>
   </div>
   <div class="grid" id="cat"></div>
@@ -413,6 +478,7 @@ const CAT = DATA.catalog || [];
 const cq = document.getElementById('cq'), cplat = document.getElementById('cplat'),
       cstate = document.getElementById('cstate'), csort = document.getElementById('csort'),
       cpay = document.getElementById('cpay'), cw3 = document.getElementById('cw3'),
+      cnew = document.getElementById('cnew'), cscope = document.getElementById('cscope'),
       catEl = document.getElementById('cat'), ccount = document.getElementById('ccount');
 
 const platCounts = {};
@@ -429,6 +495,7 @@ function renderCat(){
   const words = needle ? needle.split(/\s+/) : [];
   const plat = cplat.value, st = cstate.value, sort = csort.value;
   const payOnly = cpay.checked, w3Only = cw3.checked;
+  const fNew = cnew.checked, fScope = cscope.checked;
   let rows = CAT.filter(r => {
     if (plat && r.p !== plat) return false;
     if (st === 'live' && !LIVE[r.s]) return false;
@@ -436,6 +503,8 @@ function renderCat(){
     else if (st === 'ended' && LIVE[r.s]) return false;
     if (payOnly && !r.b) return false;
     if (w3Only && !r.w3) return false;
+    // fresh surface: union of the selected kinds (new program and/or new scope)
+    if ((fNew || fScope) && !((fNew && r.np) || (fScope && r.ns))) return false;
     if (words.length){
       const hay = (r.n + ' ' + r.u + ' ' + r.p + ' ' + (r.t||[]).join(' ')
         + ' ' + (r.sc||[]).join(' ')).toLowerCase();
@@ -445,7 +514,8 @@ function renderCat(){
   });
   if (sort === 'n') rows.sort((a,b) => a.n.toLowerCase().localeCompare(b.n.toLowerCase()));
   else if (sort === 'p') rows.sort((a,b) => (a.p+a.n).localeCompare(b.p+b.n));
-  else rows.sort((a,b) => b.mv - a.mv || a.n.toLowerCase().localeCompare(b.n.toLowerCase()));
+  else if (sort === 'mv') rows.sort((a,b) => b.mv - a.mv || a.n.toLowerCase().localeCompare(b.n.toLowerCase()));
+  else rows.sort((a,b) => b.d - a.d || b.mv - a.mv || a.n.toLowerCase().localeCompare(b.n.toLowerCase()));
 
   ccount.textContent = rows.length.toLocaleString() + ' of ' + CAT.length.toLocaleString() + ' programs';
   catEl.innerHTML = '';
@@ -466,9 +536,16 @@ function renderCat(){
     if (r.c) tags.push('<span class="t">contest</span>');
     if (r.w3) tags.push('<span class="t w3">web3</span>');
     (r.t || []).slice(0,3).forEach(t => tags.push('<span class="t">' + esc(t) + '</span>'));
-    const scope = (r.na ? r.na + ' asset' + (r.na>1?'s':'') : '')
-      + (r.sc && r.sc.length ? ' · ' + esc(r.sc.slice(0,2).join(', ')) : '')
-      + (r.w ? ' · ' + esc(r.w) : '');
+    if (r.ds){
+      const DK = {new:['🆕 new ','first seen by bbwatch'], scope:['🔭 scope ','scope grew (seen by bbwatch)'],
+                  upd:['upd ','platform last-updated date']}[r.dk] || ['', ''];
+      tags.push('<span class="t date dk-' + r.dk + '" title="' + DK[1] + '">' + DK[0] + esc(r.ds) + '</span>');
+    }
+    const parts = [];
+    if (r.na) parts.push(r.na + ' asset' + (r.na>1?'s':''));
+    if (r.sc && r.sc.length) parts.push(esc(r.sc.slice(0,2).join(', ')));
+    if (r.w) parts.push(esc(r.w));
+    const scope = parts.join(' · ');
     card.innerHTML =
       '<div class="top"><span class="nm">' + (r.u
           ? '<a href="' + encodeURI(r.u) + '" rel="noopener" target="_blank">' + esc(r.n) + '</a>'
@@ -487,7 +564,7 @@ function renderCat(){
     catEl.appendChild(more);
   }
 }
-[cq, cplat, cstate, csort, cpay, cw3].forEach(el =>
+[cq, cplat, cstate, csort, cpay, cw3, cnew, cscope].forEach(el =>
   el.addEventListener(el.type === 'checkbox' || el.tagName === 'SELECT' ? 'change' : 'input', renderCat));
 renderCat();
 
