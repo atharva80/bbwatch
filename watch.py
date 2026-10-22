@@ -224,6 +224,14 @@ def program(name, url, state, bounty, max_=None, sig=None, assets=None, tags=Non
     return p
 
 
+TEST_LISTING = re.compile(r"^\s*\[?\s*test\b", re.I)
+
+
+def is_test_listing(*names):
+    """Platforms sometimes publish their own QA fixtures ("[TEST-R2] …" on IssueHunt); they are not programs."""
+    return any(TEST_LISTING.match(str(n or "")) for n in names)
+
+
 def add_asset(assets, ident, typ, in_scope=True, bounty=None, sev=None, added=None, at=None):
     """Record one asset; `added`/`at` keep the platform's own "added to scope" date when it has one."""
     ident = str(ident or "").strip()
@@ -853,6 +861,9 @@ class IssueHunt(Source):
             d = get_json(f"https://api.issuehunt.io/programs?page={page}", timeout=60)
             rows = d.get("data") or []
             for r in rows:
+                org = (r.get("organization") or {}).get("name")
+                if r.get("type") == "internal" or is_test_listing(r.get("name"), org):
+                    continue  # internal programs aren't open to outside researchers; test fixtures aren't programs
                 paid = r.get("type") == "bounty"
                 crit = ((r.get("rewards") or {}).get("criticalityRewards") or {})
                 mx = max([_num((v or {}).get("to")) for v in crit.values()] or [0])
@@ -865,7 +876,6 @@ class IssueHunt(Source):
                     state = "closed"
                 else:
                     state = "paused" if r.get("frozen") else "open"
-                org = (r.get("organization") or {}).get("name")
                 out[r["id"]] = program(org or r.get("name"), f"https://issuehunt.io/programs/{r.get('slug') or r['id']}",
                                        state, paid and mx > 0, money(mx, "JPY") if mx else None, assets=assets,
                                        tags=["application"] if r.get("visibility") == "application" else None,
@@ -1182,7 +1192,8 @@ def diff_source(src, prev, new, book):
         missing[k] = missing.get(k, 0) + 1
         if missing[k] >= GONE_AFTER:
             del missing[k]
-            events.append(gone_event(src, prev[k]))
+            if not is_test_listing(prev[k].get("name")):  # a filtered-out fixture leaves silently
+                events.append(gone_event(src, prev[k]))
         else:
             merged[k] = prev[k]
     for k, p in new.items():
