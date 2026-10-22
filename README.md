@@ -78,7 +78,8 @@ A restart after real downtime pushes "🩺 resumed after Xh offline"; nothing
 is lost, because the first poll diffs against the last snapshot.
 
 State is the orphan branch `state`: one force-pushed commit holding
-`state.json.gz` and a readable `status.json`. `main` gets no bot commits.
+`state.json.gz`, a readable `status.json`, the change and targets logs, and the
+dashboard's data files. `main` gets no bot commits.
 
 Secrets: `NTFY_TOPIC` (required; comma-separate several topics for redundant
 delivery), `NTFY_TOKEN` (optional), `HEALTHCHECK_URL` (optional).
@@ -97,21 +98,41 @@ anywhere with Python 3.9+, e.g. an always-free VM with a systemd unit running
 
 ## Dashboard
 
-A single self-contained page at **https://atharva80.github.io/bbwatch/**, rebuilt
-by the keeper every few minutes (so its freshness tracks the state's). Two views:
+**https://atharva80.github.io/bbwatch/** — a bug-bounty radar over everything the
+watcher tracks. The page is a static app (`web/index.html`) that loads its data
+straight from the `state` branch, so it is as fresh as the watcher's last sync
+(within ~2 min of any change, 10 min at most) and re-checks every 2 min while open.
 
-- **Bounties** — the full catalog of every tracked program, flattened from
-  `state.json.gz`. Filter by text (name, URL, in-scope repo/asset, tag),
-  platform, state (defaults to live: open · active · judging), **paying-only**,
-  and **web3 / smart-contract**; sort by max bounty, name, or platform.
-- **Changes** — the rolling change feed (`changes.json`), newest first.
+- **Programs** — every program, newest listing first, with reward range, scope
+  types, target counts and hunter facts (KYC, HackenProof reputation, submission
+  fee, resolved reports, response rate). Filter by platform, scope type, listing
+  window, status, reward floor, reputation and fee; sort by listing date, last
+  update, reward (currencies roughly normalised to USD), targets or name; cards
+  or table. Bounty programs only by default, VDPs one toggle away.
+- **Latest targets** — in-scope assets as they get added, grouped per program:
+  new programs, scope additions, assets that became bounty-eligible. H1 and
+  Immunefi publish per-asset dates, so their history is exact; every platform's
+  additions are logged by the watcher as it sees them.
+- **Activity** — the change log (new / reopened / paused / scope / bounty changes).
+- **Contests** — live, upcoming, judging and recently ended.
+- **Sources** — per-platform health.
 
-`dashboard.py` embeds the data inline and makes no external request, so it works
-from Pages, a `file://` open, or a phone. Nothing is filtered for eligibility and
-max-bounty values mix currencies — they are what each platform advertises.
+Filters persist per browser and can be shared as links, e.g.
+`#programs?plats=h1,immunefi&within=7&view=list` or `#targets?within=1&paid=1`.
+
+Listing dates are the platform's own (H1 `launched_at`, Immunefi `launchDate`,
+Intigriti `createdAt`, HackenProof `published_date`, …); Bugrap and YesWeHack
+publish none, so theirs is the day bbwatch first saw the program.
+
+Data files on the `state` branch, rebuilt by `sync-state.sh` on every sync:
+`catalog.json` (programs), `latest.json` (Latest targets), next to the watcher's
+`status.json`, `changes.json` and `targets.json`. The keeper deploys the app with
+a snapshot of them under `data/`, used only if the live fetch fails.
 
 ```sh
-python3 dashboard.py --fetch --out dist/index.html   # build from the live state branch
+python3 dashboard.py data --state-dir .state              # catalog.json + latest.json
+python3 dashboard.py site --state-dir .state --out dist   # the Pages artifact
+cd dist && python3 -m http.server                          # preview
 ```
 
 ## Run locally

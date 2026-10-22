@@ -53,6 +53,10 @@ jobs:
           mkdir -p .state
           if git fetch -q --depth=1 origin state 2>/dev/null; then
             git show FETCH_HEAD:state.json.gz > .state/state.json.gz
+            # the change and targets logs span runs; without them every run starts an empty feed
+            for f in changes.json targets.json; do
+              git show "FETCH_HEAD:$f" > ".state/$f" 2>/dev/null || rm -f ".state/$f"
+            done
             echo "restored state from $(git log -1 --format=%s FETCH_HEAD)"
           else
             echo "no state branch yet: this run records the baseline"

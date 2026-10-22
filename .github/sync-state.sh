@@ -8,6 +8,11 @@ set -euo pipefail
 dir="${STATE_DIR:-.state}"
 [ -f "$dir/state.json.gz" ] || exit 0
 
+# The dashboard reads catalog.json/latest.json straight from this branch, so they are rebuilt from
+# the state on every sync. Best-effort: a dashboard build that fails must never stop the state push.
+root="$(cd "$(dirname "$0")/.." && pwd)"
+python3 "$root/dashboard.py" data --state-dir "$dir" >/dev/null || echo "dashboard data build failed; publishing state without it" >&2
+
 git config user.name >/dev/null || git config user.name "bbwatch-bot"
 git config user.email >/dev/null || git config user.email "bbwatch-bot@users.noreply.github.com"
 

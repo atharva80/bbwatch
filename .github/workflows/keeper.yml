@@ -14,6 +14,9 @@ on:
   workflow_run:
     workflows: [bbwatch]
     types: [completed]
+  push:  # ship dashboard changes right away instead of on the next keeper tick
+    branches: [main]
+    paths: ["web/**", "dashboard.py", ".github/workflows/keeper.yml"]
   workflow_dispatch:
     inputs:
       test:
@@ -69,39 +72,23 @@ jobs:
       - name: Ensure a watcher is running or queued
         run: bash .github/ensure-watcher.sh
 
-      # The dashboard renders the two files the watcher already publishes
-      # (status.json, changes.json) into one self-contained page. It rides the
-      # keeper rather than a cron of its own: the keeper is the job that fires
-      # every few minutes whatever happens to the watcher, so the page's
-      # freshness follows the state's freshness without another schedule to
-      # keep alive.
+      # The dashboard (web/index.html) loads its data live from the state
+      # branch, so this deploy only has to ship the app plus a snapshot of that
+      # data under data/ as the fallback for when the live fetch fails. The
+      # page's freshness follows the watcher's syncs, not this schedule.
       - name: Fetch the latest published state
         run: |
-          mkdir -p .state dist
-          for f in status.json changes.json; do
-            if gh api "repos/$GH_REPO/contents/$f?ref=state" --jq .content 2>/dev/null \
-                 | base64 -d > ".state/$f.tmp" && jq -e . ".state/$f.tmp" >/dev/null 2>&1; then
-              mv ".state/$f.tmp" ".state/$f"
-            else
-              rm -f ".state/$f.tmp"
-              echo "no usable $f yet"
-            fi
-          done
-          # state.json.gz is the full program catalog (binary, ~0.7 MB and
-          # growing). Pull it as raw bytes — the contents API's base64 form caps
-          # at 1 MB — and keep it only if it is really gzip, so a bad fetch
-          # leaves the dashboard without a catalog rather than breaking the build.
-          if gh api -H "Accept: application/vnd.github.raw" \
-               "repos/$GH_REPO/contents/state.json.gz?ref=state" > .state/state.json.gz.tmp 2>/dev/null \
-             && gzip -t .state/state.json.gz.tmp 2>/dev/null; then
-            mv .state/state.json.gz.tmp .state/state.json.gz
+          mkdir -p .state
+          if git fetch -q --depth=1 origin state; then
+            for f in $(git ls-tree --name-only FETCH_HEAD); do
+              git show "FETCH_HEAD:$f" > ".state/$f"
+            done
           else
-            rm -f .state/state.json.gz.tmp
-            echo "no usable state.json.gz yet"
+            echo "no state branch yet: the page deploys without a snapshot"
           fi
 
-      - name: Build the dashboard
-        run: python3 dashboard.py --state-dir .state --out dist/index.html
+      - name: Build the site
+        run: python3 dashboard.py site --state-dir .state --out dist
 
       - uses: actions/configure-pages@v5
 

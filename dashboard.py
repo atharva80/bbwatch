@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""Build bbwatch's dashboard as one self-contained HTML file.
+"""Build the data files and the static site behind bbwatch's dashboard.
 
-Two views, both rendered from the files the watcher publishes to the `state`
-branch, embedded inline so the page makes no external request (works from
-GitHub Pages, a local file, or a phone):
+The page (web/index.html) is a static app. It loads its data at runtime straight
+from the `state` branch (raw.githubusercontent.com), so it is as fresh as the
+watcher's last sync whatever the keeper's schedule does; the copies deployed with
+the page under data/ are only a fallback for when that fetch fails.
 
-  * Bounties — the full browsable catalog of every program the watcher tracks,
-    flattened from state.json.gz, with filters (search, platform, state,
-    paying-only, web3/smart-contract, sort by max bounty). This is the default.
-  * Changes — the rolling change feed (changes.json): the watcher's own events,
-    newest first.
+    python3 dashboard.py data --state-dir .state      # write catalog.json + latest.json next to the state
+    python3 dashboard.py site --state-dir .state --out dist   # the Pages artifact: index.html + data/
 
-Source health (status.json) heads both.
-
-    python3 dashboard.py --state-dir .state --out dist/index.html
-    python3 dashboard.py --fetch --out dist/index.html     # pull from state branch
+`data` runs from sync-state.sh on every state sync; `site` runs in keeper.yml.
+Both read only what the watcher already wrote: state.json.gz (every program and
+its scope), status.json (source health), changes.json (the change log) and
+targets.json (scope additions the watcher saw).
 """
 import argparse
 import datetime as dt
@@ -22,139 +20,62 @@ import gzip
 import json
 import os
 import re
-import urllib.request
+import shutil
 
-STATE_RAW = "https://raw.githubusercontent.com/atharva80/bbwatch/state"
+HERE = os.path.dirname(os.path.abspath(__file__))
+WEB = os.path.join(HERE, "web")
 
-KIND_LABEL = {
-    "NEW": "new program",
-    "SCOPE": "scope change",
-    "SCOPE_GROW": "scope grew",
-    "META": "program update",
-    "HEALTH": "watcher health",
-    "ARMED": "watcher armed",
+LABELS = {"h1": "HackerOne", "bugcrowd": "Bugcrowd", "intigriti": "Intigriti", "ywh": "YesWeHack",
+          "immunefi": "Immunefi", "cantina": "Cantina", "hackenproof": "HackenProof", "sherlock": "Sherlock",
+          "code4rena": "Code4rena", "codehawks": "CodeHawks", "standoff": "Standoff 365", "issuehunt": "IssueHunt",
+          "bugrap": "Bugrap", "bugbase": "BugBase", "huntr": "huntr"}
+
+# Asset types as each platform names them -> the handful of categories a hunter filters on.
+TYPE_CAT = {
+    "url": "web", "website": "web", "web": "web", "domain": "web", "websites_and_applications": "web",
+    "web-application": "web", "web_application": "web", "web app": "web", "website testing": "web",
+    "wildcard": "wildcard", "api": "api", "api testing": "api", "graphql": "api",
+    "android": "mobile", "ios": "mobile", "mobile": "mobile", "google_play_app_id": "mobile",
+    "apple_store_app_id": "mobile", "other_apk": "mobile", "other_ipa": "mobile", "testflight": "mobile",
+    "mobile-application": "mobile", "mobile_application": "mobile", "mobile-application-android": "mobile",
+    "mobile-application-ios": "mobile", "android application": "mobile", "ios application": "mobile",
+    "smart_contract": "contract", "smart contract": "contract", "contract": "contract", "blockchain": "contract",
+    "blockchain_dlt": "contract", "protocol": "contract", "smart_contracts": "contract",
+    "source_code": "code", "source code": "code", "github": "code", "repository": "code",
+    "cidr": "network", "iprange": "network", "ip_address": "network", "ip": "network", "network": "network",
+    "executable": "desktop", "downloadable_executables": "desktop", "windows_app_store_app_id": "desktop",
+    "application": "desktop", "desktop": "desktop",
+    "hardware": "hardware", "device": "hardware", "iot": "hardware",
+    "ai_model": "ai", "ai": "ai", "llm": "ai",
 }
-KIND_CLASS = {"NEW": "new", "SCOPE": "scope", "SCOPE_GROW": "scope", "META": "meta",
-              "HEALTH": "health", "ARMED": "health"}
-PRIO_CLASS = {5: "p5", 4: "p4", 3: "p3", 2: "p2", 1: "p1"}
 
-# Which asset types mark a program as "web3 / smart-contract" surface.
-WEB3_TYPES = {"smart_contract", "source_code", "blockchain", "contract"}
-# States whose scope strings are dropped from the catalog to keep the page
-# small — these programs are over, so searching their repos is rarely useful.
-DEAD_STATES = {"ended", "closed", "suspended"}
+# Rough USD rates, only to rank rewards across currencies. Display always keeps the original.
+FX = {"$": 1, "USD": 1, "USDC": 1, "USDT": 1, "DAI": 1, "€": 1.08, "EUR": 1.08, "£": 1.27, "GBP": 1.27,
+      "¥": 0.0066, "JPY": 0.0066, "₽": 0.011, "RUB": 0.011, "CHF": 1.12, "AUD": 0.65, "CAD": 0.73,
+      "INR": 0.012, "SGD": 0.74}
 
-
-def fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "bbwatch-dashboard"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read().decode())
+LIVE = {"open", "active", "live", "upcoming", "judging"}
+DEAD = {"ended", "closed", "suspended", "archived", "finished"}
+LATEST_DAYS = 90       # Latest targets looks back this far
+LATEST_KEEP = 8000
+SCOPE_SAMPLE = 8       # identifiers per live program kept for search and the card preview
 
 
-def fetch_bytes(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "bbwatch-dashboard"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return r.read()
-
-
-def load(state_dir, do_fetch):
-    """Return (status, changes, state) — any of which may be None if missing or
-    corrupt. A gap means a lighter page, never a failed build."""
-    status = changes = state = None
-    if do_fetch:
-        try:
-            status = fetch_json(f"{STATE_RAW}/status.json")
-        except Exception as exc:
-            print(f"! status.json: {exc}")
-        try:
-            changes = fetch_json(f"{STATE_RAW}/changes.json")
-        except Exception as exc:
-            print(f"! changes.json: {exc}")
-        try:
-            state = json.loads(gzip.decompress(fetch_bytes(f"{STATE_RAW}/state.json.gz")))
-        except Exception as exc:
-            print(f"! state.json.gz: {exc}")
-    else:
-        for name in ("status.json", "changes.json"):
-            path = os.path.join(state_dir, name)
-            if not os.path.exists(path):
-                print(f"! {name}: not present, skipping")
-                continue
-            try:
-                with open(path) as f:
-                    data = json.load(f)
-            except Exception as exc:
-                print(f"! {name}: unusable ({exc}), skipping")
-                continue
-            if name == "status.json":
-                status = data
-            else:
-                changes = data
-        gz = os.path.join(state_dir, "state.json.gz")
-        if os.path.exists(gz):
-            try:
-                with open(gz, "rb") as f:
-                    state = json.loads(gzip.decompress(f.read()))
-            except Exception as exc:
-                print(f"! state.json.gz: unusable ({exc}), skipping")
-        else:
-            print("! state.json.gz: not present, skipping")
-    return status, changes, state
-
-
-def ago(stamp):
-    """Human age of an ISO timestamp, blank when unparseable."""
-    try:
-        when = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-        delta = dt.datetime.now(dt.timezone.utc) - when
-    except Exception:
-        return ""
-    secs = int(delta.total_seconds())
-    if secs < 90:
-        return "just now"
-    if secs < 5400:
-        return f"{secs // 60} min ago"
-    if secs < 172800:
-        return f"{secs // 3600} h ago"
-    return f"{secs // 86400} d ago"
-
-
-def money(m):
-    """Best-effort numeric value of a bounty string for sorting ($, €, ¥, ₽…).
-
-    Takes the *first* number in the string (so "$55,000 USDC (plus $20,000)"
-    reads as 55000, not the two concatenated) and applies a k/m/million suffix.
-    """
-    if not m:
-        return 0
-    s = str(m)
-    mo = re.search(r"([0-9][0-9,]*)(\.[0-9]+)?\s*(k|m|million|mln)?", s, re.I)
-    if not mo:
-        return 0
-    try:
-        val = float(mo.group(1).replace(",", "") + (mo.group(2) or ""))
-    except ValueError:
-        return 0
-    suffix = (mo.group(3) or "").lower()
-    if suffix == "k":
-        val *= 1_000
-    elif suffix in ("m", "million", "mln"):
-        val *= 1_000_000
-    return int(val)
-
+# ---------- parsing helpers ----------
 
 def to_dt(v):
-    """ISO string, unix seconds/millis or "17 Nov 2025" -> aware datetime (None if unparseable).
-    Mirrors watch.py's parser so the dashboard reads the same date forms the watcher stores."""
+    """ISO string, unix seconds/millis, "17 Nov 2025" or a JS Date.toString() -> aware datetime, else None."""
     if v in (None, ""):
         return None
     try:
         if isinstance(v, (int, float)):
             return dt.datetime.fromtimestamp(v / 1000 if v > 1e12 else v, dt.timezone.utc)
-        s = str(v).strip()
-        if "GMT" in s:                       # JS Date.toString(), e.g. "Mon Mar 11 2024 01:36:34 GMT+0000 (…)"
-            s = s.split(" GMT", 1)[0]
-            d = dt.datetime.strptime(s, "%a %b %d %Y %H:%M:%S")
+        s = str(v).strip().split("|", 1)[0]           # "<date>|<extra>" sigs
+        if s.isdigit():
+            n = int(s)
+            return dt.datetime.fromtimestamp(n / 1000 if n > 1e12 else n, dt.timezone.utc)
+        if "GMT" in s:                                 # "Mon Mar 11 2024 01:36:34 GMT+0000 (…)"
+            d = dt.datetime.strptime(s.split(" GMT", 1)[0], "%a %b %d %Y %H:%M:%S")
         else:
             try:
                 d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -165,476 +86,250 @@ def to_dt(v):
         return None
 
 
-# A date must fall in this window to be believed — rejects garbage from sigs that
-# are really counts/prices (e.g. "8" parsing to 1970) rather than timestamps.
-_DATE_MIN = dt.datetime(2015, 1, 1, tzinfo=dt.timezone.utc)
+_MIN = dt.datetime(2012, 1, 1, tzinfo=dt.timezone.utc)
 
 
-def _date_of(val):
-    """(unix_ts, 'YYYY-MM-DD') for one value, (0, '') if it is not a believable date.
-    Accepts ISO, a raw unix ts (intigriti/sherlock), or a "<date>|<extra>" sig (ywh/hackenproof)."""
-    hi = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=400)
-    if isinstance(val, (int, float)):
-        d = to_dt(val)
-    elif val not in (None, ""):
-        head = str(val).split("|", 1)[0]
-        d = to_dt(int(head) if head.isdigit() else head)
+def ts(v):
+    """Unix seconds for a believable date (2012 … a year ahead), else 0 — rejects counts/prices posing as dates."""
+    d = to_dt(v)
+    if d and _MIN <= d <= dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=400):
+        return int(d.timestamp())
+    return 0
+
+
+def usd(m):
+    """Approximate USD value of a reward string ("$55,000 USDC (plus …)", "€1,000", "₽60,000,000"), 0 if unknown.
+    Takes the first number, so a parenthetical second amount does not concatenate into it."""
+    if not m:
+        return 0
+    s = str(m)
+    mo = re.search(r"([0-9][0-9,]*)(\.[0-9]+)?\s*(k|m|million|mln)?\b", s, re.I)
+    if not mo:
+        return 0
+    val = float(mo.group(1).replace(",", "") + (mo.group(2) or ""))
+    suf = (mo.group(3) or "").lower()
+    val *= 1_000 if suf == "k" else 1_000_000 if suf in ("m", "million", "mln") else 1
+    rate = next((FX[c] for c in ("$", "€", "£", "¥", "₽") if c in s), None)
+    if rate is None:
+        code = re.search(r"\b([A-Z]{3,4})\b", s)
+        rate = FX.get(code.group(1)) if code else None
+    return int(val * rate) if rate else 0
+
+
+def type_cat(typ, ident=""):
+    t = str(typ or "").strip().lower()
+    if t in TYPE_CAT:
+        cat = TYPE_CAT[t]
+    elif "contract" in t or "blockchain" in t:
+        cat = "contract"
+    elif "android" in t or "ios" in t or "mobile" in t or "apk" in t:
+        cat = "mobile"
+    elif "api" in t:
+        cat = "api"
+    elif "source" in t or "code" in t or "github" in t:
+        cat = "code"
+    elif "web" in t or "url" in t or "domain" in t or "site" in t:
+        cat = "web"
     else:
-        d = None
-    if d and _DATE_MIN <= d <= hi:
-        return int(d.timestamp()), d.strftime("%Y-%m-%d")
-    return 0, ""
-
-
-def prog_dates(r):
-    """Resolve a program's freshness signals -> dict with the freshest date (d/ds) and its kind (dk):
-    new (bbwatch first saw the program) / scope (bbwatch saw scope grow) / date (the platform's own
-    launch or updated date, from the `date` field or the `sig`)."""
-    np_ts, _ = _date_of(r.get("first_seen"))      # bbwatch first saw the program
-    ns_ts, _ = _date_of(r.get("scope_changed"))   # bbwatch last saw its scope grow
-    pd_ts = max(_date_of(r.get("date"))[0], _date_of(r.get("sig"))[0])  # platform's own date
-    d_ts, dk = max((np_ts, "new"), (ns_ts, "scope"), (pd_ts, "date"), key=lambda x: x[0])
-    d_str = dt.datetime.fromtimestamp(d_ts, dt.timezone.utc).strftime("%Y-%m-%d") if d_ts else ""
-    return {"d": d_ts, "ds": d_str, "dk": dk, "np": 1 if np_ts else 0, "ns": 1 if ns_ts else 0}
-
-
-def source_rows(status):
-    rows = []
-    for name, s in sorted(((status or {}).get("sources") or {}).items()):
-        err = s.get("error")
-        rows.append({
-            "name": name,
-            "programs": s.get("programs"),
-            "ok": not err,
-            "error": err,
-        })
-    return rows
-
-
-def build_catalog(state):
-    """Flatten every source's programs into one trimmed, searchable list."""
-    cat = []
-    for plat, s in sorted(((state or {}).get("sources") or {}).items()):
-        if plat == "mirror" or not isinstance(s, dict):
-            continue
-        for _pid, r in (s.get("programs") or {}).items():
-            if not isinstance(r, dict):
-                continue
-            assets = r.get("assets") or {}
-            types, scopes = set(), []
-            for key in assets:
-                head, _, ident = str(key).partition("|")
-                types.add(head)
-                if ident:
-                    scopes.append(ident)
-            st = r.get("state") or ""
-            is_web3 = bool(types & WEB3_TYPES) or any(
-                t.lower() in ("smart contract", "web3", "blockchain", "defi")
-                for t in (r.get("tags") or []))
-            dd = prog_dates(r)
-            cat.append({
-                "p": plat,
-                "n": r.get("name") or "",
-                "u": r.get("url") or "",
-                "m": r.get("max") or "",
-                "mv": money(r.get("max")),
-                "b": 1 if r.get("bounty") else 0,
-                "s": st,
-                "t": r.get("tags") or [],
-                "c": 1 if r.get("contest") else 0,
-                "w": r.get("when") or "",
-                "na": len(assets),
-                "ty": sorted(types),
-                "w3": 1 if is_web3 else 0,
-                "d": dd["d"],    # freshest signal, unix seconds (0 = unknown) — drives "latest" sort
-                "ds": dd["ds"],  # that date as YYYY-MM-DD
-                "dk": dd["dk"],  # which it is: new (program) / scope (grew) / upd (platform)
-                "np": dd["np"],  # 1 = bbwatch has recorded this as a new program
-                "ns": dd["ns"],  # 1 = bbwatch has recorded a scope addition on it
-                # scope idents kept only for live programs, capped, to bound size
-                "sc": [] if st in DEAD_STATES else scopes[:8],
-            })
-    # paying + live first, then by bounty value, then name
-    live_rank = {"open": 0, "active": 0, "judging": 1, "paused": 2}
-    cat.sort(key=lambda r: (live_rank.get(r["s"], 3), -r["mv"], r["n"].lower()))
+        cat = "other"
+    if cat in ("web", "other") and str(ident).startswith("*."):
+        return "wildcard"
+    if cat == "other" and str(ident).startswith("0x"):
+        return "contract"
     return cat
 
 
-def render(status, changes, catalog, generated):
-    entries = (changes or {}).get("entries") or []
-    feed = []
-    for e in entries:
-        prio = e.get("prio") or 0
-        feed.append({
-            "ts": e.get("ts"),
-            "ago": ago(e.get("ts") or ""),
-            "kind": e.get("kind") or "",
-            "kind_label": KIND_LABEL.get(e.get("kind") or "", (e.get("kind") or "").lower()),
-            "kind_class": KIND_CLASS.get(e.get("kind") or "", "meta"),
-            "prio": prio,
-            "prio_class": PRIO_CLASS.get(prio, "p1"),
-            "tag": e.get("tag") or "",
-            "url": e.get("url") or "",
-            "title": e.get("title") or "",
-            "body": e.get("body") or "",
-        })
-    updated = (status or {}).get("updated") or ""
-    payload = {
-        "generated": generated,
-        "updated": updated,
-        "updated_ago": ago(updated),
-        "sources": source_rows(status),
-        "outbox": (status or {}).get("outbox"),
-        "feed": feed,
-        "catalog": catalog,
-    }
-    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    return _TEMPLATE.replace("__DATA__", data)
+# ---------- loading ----------
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as exc:
+        print(f"! {os.path.basename(path)}: {'not present' if not os.path.exists(path) else exc}")
+        return None
 
 
-_TEMPLATE = r"""<!doctype html>
-<html lang="en" data-theme="auto">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>bbwatch — bug-bounty surface</title>
-<style>
-  :root{
-    --bg:#0e1116; --panel:#151a21; --line:#232b36; --text:#e6edf3; --dim:#9aa7b4;
-    --accent:#4c8dff; --p5:#3fb950; --p4:#d29922; --p3:#8b949e; --p2:#6e7681;
-    --chip:#1b222c;
-  }
-  @media (prefers-color-scheme: light){
-    :root{ --bg:#f6f8fa; --panel:#ffffff; --line:#d8dee4; --text:#1f2328; --dim:#59636e; --chip:#eef1f4; }
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--text);
-    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,"Helvetica Neue",sans-serif}
-  header{padding:22px 16px 12px;border-bottom:1px solid var(--line)}
-  .wrap{max-width:1100px;margin:0 auto}
-  h1{margin:0;font-size:20px;letter-spacing:-.01em}
-  h1 span{color:var(--dim);font-weight:400}
-  .meta{margin-top:6px;color:var(--dim);font-size:13px}
-  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--p5);margin-right:6px;vertical-align:1px}
-  .dot.stale{background:var(--p4)}
-  .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
-  .chip{border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:12px;color:var(--dim);background:var(--panel)}
-  .chip b{color:var(--text);font-weight:600}
-  .chip.bad{border-color:#7d2d2d;color:#ff9c9c}
-  .tabs{display:flex;gap:4px;margin-top:14px}
-  .tab{border:1px solid var(--line);border-bottom:none;background:transparent;color:var(--dim);
-    border-radius:8px 8px 0 0;padding:8px 16px;font-size:14px;cursor:pointer}
-  .tab.on{background:var(--panel);color:var(--text);font-weight:600}
-  section{padding:16px}
-  .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 14px}
-  input[type=search],select{background:var(--panel);border:1px solid var(--line);color:var(--text);
-    border-radius:8px;padding:8px 10px;font-size:14px}
-  input[type=search]{flex:1 1 240px;min-width:0}
-  label.tg{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--dim);
-    border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:7px 10px;cursor:pointer}
-  label.tg input{accent-color:var(--accent)}
-  .count{color:var(--dim);font-size:13px;margin-left:auto;white-space:nowrap}
+def load(state_dir):
+    """(status, changes, state, targets) — any of them may be None; a gap means a lighter page, never a failure."""
+    state = None
+    gz = os.path.join(state_dir, "state.json.gz")
+    try:
+        with gzip.open(gz, "rt") as f:
+            state = json.load(f)
+    except Exception as exc:
+        print(f"! state.json.gz: {'not present' if not os.path.exists(gz) else exc}")
+    return (read_json(os.path.join(state_dir, "status.json")), read_json(os.path.join(state_dir, "changes.json")),
+            state, read_json(os.path.join(state_dir, "targets.json")))
 
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px}
-  .b{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:12px 14px;
-    display:flex;flex-direction:column;gap:7px}
-  .b.dead{opacity:.6}
-  .b .top{display:flex;gap:8px;align-items:baseline}
-  .b .nm{font-weight:600;line-height:1.3}
-  .b .nm a{color:var(--text)} .b .nm a:hover{color:var(--accent)}
-  .b .pay{margin-left:auto;font-weight:700;color:var(--p5);white-space:nowrap;font-size:14px}
-  .b .pay.none{color:var(--dim);font-weight:400}
-  .tagrow{display:flex;flex-wrap:wrap;gap:5px}
-  .t{font-size:11px;border-radius:5px;padding:2px 7px;border:1px solid var(--line);color:var(--dim);background:var(--chip)}
-  .t.plat{color:var(--accent);border-color:var(--accent)}
-  .t.w3{color:#d2a8ff;border-color:#4a3766}
-  .t.date{color:var(--dim);border-color:var(--line);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-  .t.date.dk-new{color:#7ee787;border-color:#2b5a34}
-  .t.date.dk-scope{color:#79c0ff;border-color:#264a72}
-  .fresh{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--dim)}
-  .t.st-open,.t.st-active{color:#7ee787;border-color:#2b5a34}
-  .t.st-judging{color:#79c0ff;border-color:#264a72}
-  .t.st-paused,.t.st-suspended{color:#d29922;border-color:#6b5420}
-  .t.st-ended,.t.st-closed{color:var(--dim)}
-  .b .sc{color:var(--dim);font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-  .card{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:12px 14px;margin:10px 0}
-  .card.health{opacity:.75}
-  .row{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
-  .badge{font-size:11px;text-transform:uppercase;letter-spacing:.04em;border-radius:5px;padding:2px 7px;border:1px solid var(--line);color:var(--dim)}
-  .badge.new{color:#7ee787;border-color:#2b5a34}
-  .badge.scope{color:#79c0ff;border-color:#264a72}
-  .badge.health{color:#d2a8ff;border-color:#4a3766}
-  .prio5{border-left:3px solid var(--p5)} .prio4{border-left:3px solid var(--p4)}
-  .prio3{border-left:3px solid var(--p3)} .prio2{border-left:3px solid var(--p2)}
-  .title{font-weight:600}
-  .time{color:var(--dim);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;margin-left:auto}
-  pre{margin:8px 0 0;white-space:pre-wrap;color:var(--dim);font-size:13px;
-    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-  a{color:var(--accent);text-decoration:none}
-  a:hover{text-decoration:underline}
-  .empty{color:var(--dim);border:1px dashed var(--line);border-radius:10px;padding:18px;text-align:center}
-  footer{padding:10px 16px 30px;color:var(--dim);font-size:12px}
-  .hide{display:none}
-</style>
-</head>
-<body>
-<header><div class="wrap">
-  <h1>bbwatch <span>· bug-bounty surface</span></h1>
-  <div class="meta"><span id="liveness" class="dot"></span><span id="liveness-text"></span>
-    · source data <span id="updated"></span> · built <span id="generated"></span></div>
-  <div class="chips" id="sources"></div>
-  <div class="tabs">
-    <button class="tab on" id="tab-cat" data-view="cat">Bounties</button>
-    <button class="tab" id="tab-feed" data-view="feed">Changes</button>
-  </div>
-</div></header>
+# ---------- the catalog ----------
 
-<section class="wrap" id="view-cat">
-  <div class="controls">
-    <input type="search" id="cq" placeholder="search name, url, scope repo, tag…">
-    <select id="cplat"><option value="">all platforms</option></select>
-    <select id="cstate">
-      <option value="live">live (open · active · judging)</option>
-      <option value="open">open only</option>
-      <option value="">any status</option>
-      <option value="ended">ended / past</option>
-    </select>
-    <select id="cwindow" title="filters by a program's newest date — new listing, scope change, or platform update">
-      <option value="0">added/updated: any time</option>
-      <option value="1">· last 24 hours</option>
-      <option value="7">· last 7 days</option>
-      <option value="30">· last 30 days</option>
-      <option value="90">· last 90 days</option>
-    </select>
-    <select id="csort">
-      <option value="d">sort: newest first</option>
-      <option value="mv">sort: biggest bounty</option>
-      <option value="n">sort: name A–Z</option>
-    </select>
-    <label class="tg"><input type="checkbox" id="cpay">paying only</label>
-    <label class="tg"><input type="checkbox" id="cw3">web3 / smart contract</label>
-    <span class="count" id="ccount"></span>
-  </div>
-  <div class="grid" id="cat"></div>
-</section>
+def program_tags(r):
+    tags = list(r.get("tags") or [])
+    meta = r.get("meta") or {}
+    if "rep" in meta:
+        tags.append("no rep needed" if not meta["rep"] else f"rep ≥ {meta['rep']}")
+    if meta.get("fee"):
+        tags.append(f"fee {meta['fee']}")
+    return tags
 
-<section class="wrap hide" id="view-feed">
-  <div class="controls">
-    <input type="search" id="q" placeholder="filter changes: program, kind, domain…">
-    <select id="kind">
-      <option value="">all kinds</option>
-      <option value="NEW">new programs</option>
-      <option value="SCOPE">scope changes</option>
-      <option value="META">program updates</option>
-      <option value="HEALTH">watcher health</option>
-    </select>
-    <select id="prio">
-      <option value="">any priority</option>
-      <option value="5">priority 5 — live + bounty</option>
-      <option value="4">priority 4+</option>
-      <option value="3">priority 3+</option>
-    </select>
-    <span class="count" id="count"></span>
-  </div>
-  <div id="feed"></div>
-</section>
 
-<footer class="wrap">Catalog is every program the watcher tracks, newest snapshot.
-Changes are its own events, newest first. Nothing is filtered for eligibility:
-a program you cannot submit to is still listed. Max-bounty values mix currencies
-and are approximate — they are what the platform advertises.</footer>
+def build_catalog(state):
+    out = []
+    for plat, src in sorted(((state or {}).get("sources") or {}).items()):
+        if plat == "mirror" or not isinstance(src, dict):
+            continue
+        for key, r in (src.get("programs") or {}).items():
+            if not isinstance(r, dict):
+                continue
+            assets = r.get("assets") or {}
+            live_scope = [(k, v) for k, v in assets.items() if v and v[0]]
+            cats, idents = set(), []
+            paid_n = 0
+            for k, v in sorted(live_scope, key=lambda kv: (not (kv[1][1] is True or (kv[1][1] is None and r.get("bounty"))), kv[0])):
+                typ, _, ident = k.partition("|")
+                cats.add(type_cat(typ, ident))
+                idents.append(ident)
+                if v[1] is True or (v[1] is None and r.get("bounty")):
+                    paid_n += 1
+            st = r.get("state") or ""
+            first = ts(r.get("first_seen"))
+            listed_p = ts(r.get("listed")) or ts(r.get("date"))   # `date` = the field's name before `listed`
+            updated = max(ts(r.get("updated")), ts(r.get("sig")), ts(r.get("scope_changed")))
+            meta = r.get("meta") or {}
+            out.append({
+                "id": f"{plat}:{key}",
+                "p": plat,
+                "n": r.get("name") or "",
+                "u": r.get("url") or "",
+                "s": st,
+                "b": 1 if r.get("bounty") else 0,
+                "c": 1 if r.get("contest") else 0,
+                "w": r.get("when") or "",
+                "mx": r.get("max") or "",
+                "mn": r.get("min") or "",
+                "usd": usd(r.get("max")),
+                "t": program_tags(r),
+                "m": {k: meta[k] for k in ("rep", "reports", "resp") if k in meta},
+                "fee": 1 if meta.get("fee") else 0,
+                "ty": sorted(cats),
+                "na": len(live_scope),
+                "np": paid_n,
+                "sc": [] if st in DEAD else idents[:SCOPE_SAMPLE],
+                "L": listed_p or first,           # listing date: the platform's, else when bbwatch first saw it
+                "Lw": 0 if listed_p else (1 if first else 0),
+                "U": max(updated, first),          # last activity: platform update, scope growth, discovery
+                "S": ts(r.get("scope_changed")),
+                "F": first,
+            })
+    out.sort(key=lambda r: (-r["L"], r["n"].lower()))
+    return out
 
-<script>
-const DATA = __DATA__;
 
-document.getElementById('updated').textContent = DATA.updated || 'unknown';
-document.getElementById('generated').textContent = (DATA.generated || '').replace('T',' ').replace('Z',' UTC');
-const fresh = DATA.updated ? (Date.now() - Date.parse(DATA.updated)) : Infinity;
-const live = fresh < 30*60*1000;
-const dot = document.getElementById('liveness');
-if (!live) dot.classList.add('stale');
-document.getElementById('liveness-text').textContent = live
-  ? 'watcher live' : 'watcher last synced ' + (DATA.updated_ago || 'unknown');
-if (typeof DATA.outbox === 'number' && DATA.outbox > 0)
-  document.getElementById('liveness-text').textContent += ' · ' + DATA.outbox + ' queued push(es)';
+# ---------- latest targets ----------
 
-const sources = document.getElementById('sources');
-(DATA.sources || []).forEach(s => {
-  const div = document.createElement('span');
-  div.className = 'chip' + (s.ok ? '' : ' bad');
-  div.innerHTML = '<b>' + esc(s.name) + '</b> · ' + (s.programs ?? '?')
-    + (s.ok ? '' : ' · ' + esc(s.error || 'error'));
-  sources.appendChild(div);
-});
+def build_latest(state, targets, catalog):
+    """Recently added in-scope targets: the platform's own per-asset dates (H1, Immunefi) merged with the
+    additions the watcher observed (every platform), one row per (program, asset), newest first."""
+    now = dt.datetime.now(dt.timezone.utc).timestamp()
+    since = now - LATEST_DAYS * 86400
+    by_id = {r["id"]: r for r in catalog}
+    rows = {}
 
-function esc(t){ const d = document.createElement('div'); d.textContent = t == null ? '' : t; return d.innerHTML; }
+    def put(row):
+        k = (row["id"], row["a"])
+        old = rows.get(k)
+        if old is None:
+            rows[k] = row
+        else:  # keep the platform's date when there is one (it is exact), the watcher's reason otherwise
+            if row.get("pd") and not old.get("pd"):
+                row["w"] = old["w"] if old["w"] != "added" else row["w"]
+                rows[k] = row
+            elif old.get("w") == "added" and row.get("w") != "added":
+                old["w"] = row["w"]
 
-/* ---- tabs ---- */
-document.querySelectorAll('.tab').forEach(btn => btn.addEventListener('click', () => {
-  document.querySelectorAll('.tab').forEach(b => b.classList.remove('on'));
-  btn.classList.add('on');
-  const v = btn.dataset.view;
-  document.getElementById('view-cat').classList.toggle('hide', v !== 'cat');
-  document.getElementById('view-feed').classList.toggle('hide', v !== 'feed');
-}));
+    for plat, src in ((state or {}).get("sources") or {}).items():
+        for key, r in ((src or {}).get("programs") or {}).items():
+            added = r.get("added") or {}
+            if not added:
+                continue
+            assets = r.get("assets") or {}
+            pid = f"{plat}:{key}"
+            prog = by_id.get(pid) or {}
+            launched = prog.get("L") or 0
+            for k, when in added.items():
+                t = ts(when)
+                a = assets.get(k)
+                if t < since or not a or not a[0]:
+                    continue
+                typ, _, ident = k.partition("|")
+                put({"t": t, "id": pid, "p": plat, "n": r.get("name") or "", "u": r.get("url") or "",
+                     "a": ident, "y": typ, "c": type_cat(typ, ident),
+                     "$": 1 if (a[1] is True or (a[1] is None and r.get("bounty"))) else 0,
+                     "w": "new" if launched and t <= launched + 3 * 86400 and launched >= since else "added",
+                     "mx": r.get("max") or "", "pd": 1})
 
-/* ---- catalog ---- */
-const CAT = DATA.catalog || [];
-const cq = document.getElementById('cq'), cplat = document.getElementById('cplat'),
-      cstate = document.getElementById('cstate'), csort = document.getElementById('csort'),
-      cpay = document.getElementById('cpay'), cw3 = document.getElementById('cw3'),
-      cwindow = document.getElementById('cwindow'),
-      catEl = document.getElementById('cat'), ccount = document.getElementById('ccount');
+    for e in (targets or {}).get("entries") or []:
+        t = ts(e.get("ts"))
+        if t < since:
+            continue
+        pid = f"{e.get('src')}:{e.get('key')}"
+        ident = e.get("asset") or ""
+        put({"t": t, "id": pid, "p": e.get("src") or "", "n": e.get("name") or "", "u": e.get("url") or "",
+             "a": ident, "y": e.get("type") or "", "c": type_cat(e.get("type"), ident),
+             "$": 1 if e.get("paid") else 0, "w": e.get("why") or "added", "mx": e.get("max") or ""})
 
-const platCounts = {};
-CAT.forEach(r => { platCounts[r.p] = (platCounts[r.p] || 0) + 1; });
-Object.keys(platCounts).sort().forEach(p => {
-  const o = document.createElement('option');
-  o.value = p; o.textContent = p + ' (' + platCounts[p] + ')';
-  cplat.appendChild(o);
-});
+    out = sorted(rows.values(), key=lambda r: (-r["t"], r["n"].lower(), r["a"]))[:LATEST_KEEP]
+    return out
 
-const LIVE = {open:1, active:1, judging:1};
-function renderCat(){
-  const needle = (cq.value || '').toLowerCase().trim();
-  const words = needle ? needle.split(/\s+/) : [];
-  const plat = cplat.value, st = cstate.value, sort = csort.value;
-  const payOnly = cpay.checked, w3Only = cw3.checked;
-  const winDays = parseInt(cwindow.value || '0', 10);
-  const cutoff = winDays ? (Date.now()/1000 - winDays*86400) : 0;
-  let rows = CAT.filter(r => {
-    if (plat && r.p !== plat) return false;
-    if (st === 'live' && !LIVE[r.s]) return false;
-    else if (st === 'open' && r.s !== 'open') return false;
-    else if (st === 'ended' && LIVE[r.s]) return false;
-    if (payOnly && !r.b) return false;
-    if (w3Only && !r.w3) return false;
-    // fresh surface: newest date (new listing / scope change / platform update) within the window
-    if (cutoff && !(r.d && r.d >= cutoff)) return false;
-    if (words.length){
-      const hay = (r.n + ' ' + r.u + ' ' + r.p + ' ' + (r.t||[]).join(' ')
-        + ' ' + (r.sc||[]).join(' ')).toLowerCase();
-      if (!words.every(w => hay.includes(w))) return false;
-    }
-    return true;
-  });
-  if (sort === 'n') rows.sort((a,b) => a.n.toLowerCase().localeCompare(b.n.toLowerCase()));
-  else if (sort === 'mv') rows.sort((a,b) => b.mv - a.mv || a.n.toLowerCase().localeCompare(b.n.toLowerCase()));
-  else rows.sort((a,b) => b.d - a.d || b.mv - a.mv || a.n.toLowerCase().localeCompare(b.n.toLowerCase()));
 
-  ccount.textContent = rows.length.toLocaleString() + ' of ' + CAT.length.toLocaleString() + ' programs';
-  catEl.innerHTML = '';
-  if (!rows.length){
-    catEl.innerHTML = '<div class="empty">' + (CAT.length
-      ? 'no program matches these filters'
-      : 'catalog not available — the watcher snapshot has not been published yet') + '</div>';
-    return;
-  }
-  const frag = document.createDocumentFragment();
-  const dead = {ended:1, closed:1, suspended:1};
-  for (const r of rows.slice(0, 600)){
-    const card = document.createElement('div');
-    card.className = 'b' + (dead[r.s] ? ' dead' : '');
-    const tags = [];
-    tags.push('<span class="t plat">' + esc(r.p) + '</span>');
-    if (r.s) tags.push('<span class="t st-' + esc(r.s) + '">' + esc(r.s) + '</span>');
-    if (r.c) tags.push('<span class="t">contest</span>');
-    if (r.w3) tags.push('<span class="t w3">web3</span>');
-    (r.t || []).slice(0,3).forEach(t => tags.push('<span class="t">' + esc(t) + '</span>'));
-    if (r.ds){
-      const DK = {new:['🆕 new ','first seen by bbwatch'], scope:['🔭 scope ','scope grew (seen by bbwatch)'],
-                  date:['📅 ','the platform\'s own launch / updated date']}[r.dk] || ['', ''];
-      tags.push('<span class="t date dk-' + r.dk + '" title="' + DK[1] + '">' + DK[0] + esc(r.ds) + '</span>');
-    }
-    const parts = [];
-    if (r.na) parts.push(r.na + ' asset' + (r.na>1?'s':''));
-    if (r.sc && r.sc.length) parts.push(esc(r.sc.slice(0,2).join(', ')));
-    if (r.w) parts.push(esc(r.w));
-    const scope = parts.join(' · ');
-    card.innerHTML =
-      '<div class="top"><span class="nm">' + (r.u
-          ? '<a href="' + encodeURI(r.u) + '" rel="noopener" target="_blank">' + esc(r.n) + '</a>'
-          : esc(r.n)) + '</span>'
-        + '<span class="pay' + (r.b && r.mv ? '' : ' none') + '">'
-          + (r.m ? esc(r.m) : (r.b ? 'paid' : 'VDP')) + '</span></div>'
-      + '<div class="tagrow">' + tags.join('') + '</div>'
-      + (scope ? '<div class="sc">' + scope + '</div>' : '');
-    frag.appendChild(card);
-  }
-  catEl.appendChild(frag);
-  if (rows.length > 600){
-    const more = document.createElement('div');
-    more.className = 'empty';
-    more.textContent = 'showing the first 600 — narrow the filters to see the rest';
-    catEl.appendChild(more);
-  }
-}
-[cq, cplat, cstate, cwindow, csort, cpay, cw3].forEach(el =>
-  el.addEventListener(el.type === 'checkbox' || el.tagName === 'SELECT' ? 'change' : 'input', renderCat));
-renderCat();
+# ---------- writing ----------
 
-/* ---- change feed ---- */
-const feed = document.getElementById('feed'), q = document.getElementById('q'),
-      kind = document.getElementById('kind'), prio = document.getElementById('prio'),
-      count = document.getElementById('count');
-function renderFeed(){
-  const needle = (q.value || '').toLowerCase().trim();
-  const k = kind.value, p = parseInt(prio.value || '0', 10);
-  const rows = (DATA.feed || []).filter(e => {
-    if (k && e.kind_class !== (k === 'SCOPE' ? 'scope' : k.toLowerCase())) return false;
-    if (p && (e.prio || 0) < p) return false;
-    if (!needle) return true;
-    return (e.title + ' ' + e.body + ' ' + e.tag + ' ' + e.url).toLowerCase().includes(needle);
-  });
-  count.textContent = rows.length + ' of ' + (DATA.feed || []).length + ' change(s)';
-  feed.innerHTML = '';
-  if (!rows.length){
-    feed.innerHTML = '<div class="empty">' + ((DATA.feed || []).length
-      ? 'no change matches this filter'
-      : 'no changes recorded yet — the watcher logs them as they arrive') + '</div>';
-    return;
-  }
-  for (const e of rows){
-    const card = document.createElement('div');
-    card.className = 'card prio' + (e.prio || 1) + (e.kind_class === 'health' ? ' health' : '');
-    card.innerHTML =
-      '<div class="row"><span class="badge ' + e.kind_class + '">' + esc(e.kind_label) + '</span>'
-      + '<span class="badge">' + esc(e.tag) + '</span>'
-      + '<span class="title">' + esc(e.title) + '</span>'
-      + '<span class="time" title="' + esc(e.ts) + '">' + esc(e.ago || e.ts) + '</span></div>'
-      + (e.body ? '<pre>' + esc(e.body) + '</pre>' : '')
-      + (e.url ? '<div style="margin-top:8px"><a href="' + encodeURI(e.url) + '" rel="noopener" target="_blank">open program →</a></div>' : '');
-    feed.appendChild(card);
-  }
-}
-q.addEventListener('input', renderFeed);
-kind.addEventListener('change', renderFeed);
-prio.addEventListener('change', renderFeed);
-renderFeed();
-</script>
-</body></html>
-"""
+def write_json(path, doc):
+    with open(path + ".tmp", "w") as f:
+        json.dump(doc, f, ensure_ascii=False, separators=(",", ":"))
+    os.replace(path + ".tmp", path)
+
+
+def build_data(state_dir, out_dir):
+    status, changes, state, targets = load(state_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    updated = (status or {}).get("updated") or stamp
+    catalog = build_catalog(state)
+    latest = build_latest(state, targets, catalog)
+    if state is not None:  # never replace a good published catalog with an empty one
+        write_json(os.path.join(out_dir, "catalog.json"),
+                   {"generated": stamp, "updated": updated, "labels": LABELS, "programs": catalog})
+        write_json(os.path.join(out_dir, "latest.json"), {"generated": stamp, "updated": updated, "entries": latest})
+    print(f"data: {len(catalog)} programs, {len(latest)} latest targets -> {out_dir}")
+    return status, changes
+
+
+def build_site(state_dir, out):
+    data = os.path.join(out, "data")
+    status, changes = build_data(state_dir, data)
+    for name, doc in (("status.json", status), ("changes.json", changes)):
+        if doc is not None:
+            write_json(os.path.join(data, name), doc)
+    for f in os.listdir(WEB):
+        src = os.path.join(WEB, f)
+        if os.path.isfile(src):
+            shutil.copy(src, os.path.join(out, f))
+    print(f"site -> {out}")
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["data", "site"])
     ap.add_argument("--state-dir", default=".state")
-    ap.add_argument("--out", default="dist/index.html")
-    ap.add_argument("--fetch", action="store_true", help="read state from the state branch")
+    ap.add_argument("--out", default="dist", help="site output directory (site only)")
     args = ap.parse_args()
-    status, changes, state = load(args.state_dir, args.fetch)
-    catalog = build_catalog(state)
-    generated = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    html = render(status, changes, catalog, generated)
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    with open(args.out, "w") as f:
-        f.write(html)
-    print(f"wrote {args.out}: {len(html)} bytes, "
-          f"{len(catalog)} program(s), "
-          f"{len((changes or {}).get('entries') or [])} change(s), "
-          f"{len((status or {}).get('sources') or {})} source(s)")
+    if args.cmd == "data":
+        build_data(args.state_dir, args.state_dir)
+    else:
+        build_site(args.state_dir, args.out)
 
 
 if __name__ == "__main__":

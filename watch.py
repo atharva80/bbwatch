@@ -71,7 +71,13 @@ STATUS_FILE = os.path.join(STATE_DIR, "status.json")
 # sync-state.sh. Presentation data only: the push dedup lives in state.json.gz,
 # so a lost or corrupt log costs a dashboard row, never a notification.
 CHANGES_FILE = os.path.join(STATE_DIR, "changes.json")
-CHANGES_KEEP = 400
+CHANGES_KEEP = 2000
+# Every in-scope target the watcher saw appear (new program, added to scope, became
+# bounty-eligible), one row per asset: the dashboard's "Latest targets" feed. Same
+# contract as the change log — presentation only, never on the notification path.
+TARGETS_FILE = os.path.join(STATE_DIR, "targets.json")
+TARGETS_KEEP = 5000
+TARGETS_PER_PROGRAM = 150  # a big launch logs its first N targets, not thousands
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 DRY_RUN = bool(os.environ.get("DRY_RUN"))
 MIN_PRIORITY = int(os.environ.get("MIN_PRIORITY", "2"))
@@ -80,7 +86,9 @@ GONE_AFTER = 3        # consecutive polls a program must be missing before it co
 FAIL_ALERT = 5        # consecutive failed polls before a source-health push
 MAX_PUSHES = 8        # individual pushes per poll; the rest collapse into one digest
 MAX_LINES = 12        # asset/detail lines per push
-SYNC_EVERY = 600      # seconds between state syncs when nothing notifiable happened
+SYNC_EVERY = 600      # seconds between state syncs when nothing happened
+SYNC_ON_CHANGE = 120  # ...and at most this often when something changed but nothing was pushed
+SHORT_ACCEPT = 1200   # a listing that stays <80% of last time this long is real, not a hiccup
 DEDUP_FOR = 12 * 3600
 
 STOP = threading.Event()
@@ -197,7 +205,7 @@ def _num(v):
 #           or None when the scope is not known (never diffed, never erases)
 
 def program(name, url, state, bounty, max_=None, sig=None, assets=None, tags=None, ref=None,
-            contest=False, window=None, date=None):
+            contest=False, window=None, listed=None, updated=None, min_=None, meta=None, added=None):
     p = {"name": " ".join(str(name or "?").split()), "url": url, "state": state, "bounty": bool(bounty),
          "max": max_, "sig": sig, "assets": assets}
     if tags:
@@ -208,20 +216,27 @@ def program(name, url, state, bounty, max_=None, sig=None, assets=None, tags=Non
         p["contest"] = True
     if window:
         p["when"] = window  # shown in messages, never diffed
-    if date:
-        p["date"] = date  # the platform's own launch/updated date; presentation only, never diffed
+    # Presentation only, never diffed: when the platform listed it, last updated it, the low end of
+    # its reward range, small facts a hunter filters on (rep, fee, reports…), per-asset added dates.
+    for field, val in (("listed", listed), ("updated", updated), ("min", min_), ("meta", meta), ("added", added)):
+        if val not in (None, "", {}):
+            p[field] = val
     return p
 
 
-def add_asset(assets, ident, typ, in_scope=True, bounty=None, sev=None):
+def add_asset(assets, ident, typ, in_scope=True, bounty=None, sev=None, added=None, at=None):
+    """Record one asset; `added`/`at` keep the platform's own "added to scope" date when it has one."""
     ident = str(ident or "").strip()
     if not ident:
-        return
+        return None
     k = f"{str(typ or 'other').strip().lower()}|{ident}"
     old = assets.get(k)
     if old:  # the same asset listed twice: the widest entry wins
         in_scope, bounty, sev = old[0] or in_scope, old[1] or bounty, old[2] or sev
     assets[k] = [bool(in_scope), bounty, sev]
+    if added is not None and at and (k not in added or str(at) < str(added[k])):
+        added[k] = at
+    return k
 
 
 # ---------- sources ----------
@@ -251,14 +266,26 @@ class Source:
     def poll(self, prev, book):
         progs = self.listing(prev, book)
         if len(prev) > 10 and len(progs) < 0.8 * len(prev):
-            raise RuntimeError(f"partial listing: {len(progs)} programs vs {len(prev)} last time")
+            # One short listing is a platform hiccup; one that stays short is the platform's new size.
+            # Rejecting it forever wedged IssueHunt for days after a single inflated count.
+            since = book.setdefault("short_since", time.time())
+            if time.time() - since < SHORT_ACCEPT:
+                raise RuntimeError(f"partial listing: {len(progs)} programs vs {len(prev)} last time")
+            log(f"{self.label}: listing stayed at {len(progs)} (was {len(prev)}) for "
+                f"{int((time.time() - since) // 60)} min — accepting it as the new size")
+            book["rebase"] = len(prev)
+        book.pop("short_since", None)
+        for k, p in progs.items():  # fields only a rotated detail fetch fills survive polls that skip it
+            o = prev.get(k)
+            if o is not None:
+                for f in ("listed", "updated", "added"):
+                    if f not in p and o.get(f):
+                        p[f] = o[f]
         if self.detail is None:
             return progs
         want = {k for k in self.take_force() if k in progs}
         for k, p in progs.items():
             o = prev.get(k)
-            if o is not None and not p.get("date") and o.get("date"):
-                p["date"] = o["date"]  # a date set by a rotated detail fetch survives polls that skip it
             if o is not None and p["assets"] is None:
                 p["assets"] = o.get("assets")
                 if "ver" in o:
@@ -299,7 +326,7 @@ def _b64(n):
 
 class HackerOne(Source):
     name, label = "h1", "H1"
-    FIELDS = "asset_identifier asset_type eligible_for_submission eligible_for_bounty max_severity"
+    FIELDS = "asset_identifier asset_type eligible_for_submission eligible_for_bounty max_severity created_at"
     # All public teams, open or not, so pauses and re-opens show up as status
     # changes instead of fake removals/new programs. ASC keeps page offsets
     # stable while new programs are appended at the end.
@@ -309,7 +336,8 @@ class HackerOne(Source):
     total_count
     pageInfo { endCursor hasNextPage }
     nodes {
-      handle name offers_bounties submission_state started_accepting_at
+      handle name offers_bounties submission_state launched_at started_accepting_at currency
+      minimum_bounty_table_value maximum_bounty_table_value resolved_report_count response_efficiency_percentage
       structured_scopes(first: 100, archived: false) { total_count pageInfo { hasNextPage } nodes { %s } }
     }
   }
@@ -378,7 +406,7 @@ class HackerOne(Source):
             o = prev.get(n["handle"])
             if (o and o.get("assets") is not None and o.get("sig") == n["structured_scopes"]["total_count"]
                     and n["handle"] not in pick):
-                n["reuse"] = o["assets"]
+                n["reuse"], n["reuse_added"] = o["assets"], o.get("added")
             else:
                 refetch.append(n)
         with ThreadPoolExecutor(8) as ex:
@@ -387,18 +415,23 @@ class HackerOne(Source):
         out = {}
         for n in nodes:
             ss = n["structured_scopes"]
-            assets = n.get("reuse")
+            assets, added = n.get("reuse"), n.get("reuse_added")
             # H1 sometimes returns timed-out blank scopes: treat the team's scope as unknown
             if assets is None and all(s and s.get("asset_identifier") for s in ss["nodes"]) \
                     and not ss["pageInfo"]["hasNextPage"]:
-                assets = {}
+                assets, added = {}, {}
                 for s in ss["nodes"]:
                     add_asset(assets, s["asset_identifier"], s["asset_type"], s["eligible_for_submission"],
-                              s["eligible_for_bounty"], s["max_severity"])
+                              s["eligible_for_bounty"], s["max_severity"], added, s.get("created_at"))
             state = {"disabled": "closed"}.get(n["submission_state"], n["submission_state"])
+            cur = n.get("currency") or "usd"
+            lo, hi = n.get("minimum_bounty_table_value"), n.get("maximum_bounty_table_value")
+            meta = {k: v for k, v in (("reports", n.get("resolved_report_count")),
+                                      ("resp", n.get("response_efficiency_percentage"))) if v}
             out[n["handle"]] = program(n["name"], f"https://hackerone.com/{n['handle']}", state,
-                                       n["offers_bounties"], sig=ss["total_count"], assets=assets,
-                                       date=n.get("started_accepting_at"))
+                                       n["offers_bounties"], money(hi, cur) if hi else None, sig=ss["total_count"],
+                                       assets=assets, listed=n.get("launched_at") or n.get("started_accepting_at"),
+                                       min_=money(lo, cur) if lo else None, meta=meta or None, added=added or None)
         if len(out) < 0.9 * total:
             raise RuntimeError(f"partial listing: {len(out)}/{total}")
         return out
@@ -438,15 +471,20 @@ class Bugcrowd(Source):
             if e.get("isDemo") or not e.get("briefUrl"):
                 continue
             path = e["briefUrl"].rstrip("/")
-            mx = (e.get("rewardSummary") or {}).get("maxReward")
+            rs = e.get("rewardSummary") or {}
+            mx = rs.get("maxReward")
             out[path.rsplit("/", 1)[-1]] = program(
                 e.get("name"), "https://bugcrowd.com" + path, str(e.get("accessStatus") or "open").lower(),
-                "$" in str(mx or ""), mx, sig=f"{mx}|{e.get('accessStatus')}", ref=path)
+                "$" in str(mx or ""), mx, sig=f"{mx}|{e.get('accessStatus')}", ref=path,
+                min_=rs.get("minReward") if "$" in str(rs.get("minReward") or "") else None)
         return out
 
     def detail(self, key, p):
         base = "https://bugcrowd.com" + p["ref"]
         logs = get_json(base + "/changelog.json").get("changelogs") or []
+        stamps = sorted(c["publishedAt"] for c in logs if c.get("publishedAt"))
+        if stamps:  # Bugcrowd's only dates: first published brief ≈ listing, newest = last scope update
+            p["listed"], p["updated"] = stamps[0], stamps[-1]
         latest = next((c for c in logs if c.get("changelogState") == "Latest"), logs[0] if logs else None)
         if latest is None or (latest["id"] == p.get("ver") and p.get("assets") is not None):
             return
@@ -459,8 +497,6 @@ class Bugcrowd(Source):
                 add_asset(assets, t.get("uri") or t.get("name") or t.get("ipAddress"), t.get("category"),
                           in_scope, paid)
         p["assets"], p["ver"] = assets, latest["id"]
-        if latest.get("publishedAt"):
-            p["date"] = latest["publishedAt"]  # scope last published — Bugcrowd's only per-program date
 
 
 class Intigriti(Source):
@@ -478,8 +514,8 @@ class Intigriti(Source):
                      data={"requests": [{"indexName": "programs_prod", "hitsPerPage": 1000, "page": 0, "query": ""}]})
         out = {}
         for h in d["results"][0]["hits"]:
-            mx = h.get("maxBounty") or {}
-            val = mx.get("value") or 0
+            mx, mn = h.get("maxBounty") or {}, h.get("minBounty") or {}
+            val, lo = mx.get("value") or 0, mn.get("value") or 0
             conf = _at(self.CONF, h.get("confidentialityLevel"))
             tags = [t for t, on in ((conf, conf != "public"), ("T&C", h.get("tacRequired")),
                                     ("2FA", h.get("twoFactorRequired"))) if on]
@@ -488,7 +524,8 @@ class Intigriti(Source):
                 h.get("name"), f"https://www.intigriti.com/programs/{q(ch)}/{q(hd)}/detail",
                 _at(self.STATUS, h.get("status")), val > 0,
                 money(val, mx.get("currency")) if val else None,
-                sig=h.get("lastUpdatedAt"), tags=tags, ref=[ch, hd])
+                sig=h.get("lastUpdatedAt"), tags=tags, ref=[ch, hd], listed=h.get("createdAt"),
+                updated=h.get("lastUpdatedAt"), min_=money(lo, mn.get("currency")) if lo else None)
         return out
 
     def detail(self, key, p):
@@ -523,12 +560,17 @@ class YesWeHack(Source):
                 state = "closed"
             else:
                 state = "open" if r.get("status") == "V" else str(r.get("status")).lower()
-            mx = r.get("bounty_reward_max") or 0
+            mx, lo = r.get("bounty_reward_max") or 0, r.get("bounty_reward_min") or 0
+            cur = r.get("currency") or "EUR"
+            fee = _num(r.get("report_submission_cost"))
+            meta = {k: v for k, v in (("fee", money(fee, cur) if fee else None),
+                                      ("reports", r.get("reports_count"))) if v}
             out[r["slug"]] = program(
                 r.get("title"), f"https://yeswehack.com/programs/{r['slug']}", state, r.get("bounty"),
-                money(mx, r.get("currency") or "EUR") if mx else None,
+                money(mx, cur) if mx else None,
                 sig=f"{r.get('last_update_at')}|{r.get('scopes_count')}",
-                tags=["VDP"] if r.get("vdp") else None)
+                tags=["VDP"] if r.get("vdp") else None, updated=r.get("last_update_at"),
+                min_=money(lo, cur) if lo else None, meta=meta or None)
         return out
 
     def detail(self, key, p):
@@ -563,14 +605,15 @@ class Immunefi(Source):
             if b.get("endDate") and b["endDate"] < now:
                 state = "ended"
             mx = b.get("maxBounty") or 0
-            assets = {}
+            assets, added = {}, {}
             for a in b.get("assets") or []:
-                add_asset(assets, a.get("url"), a.get("type"), True, True)
+                add_asset(assets, a.get("url"), a.get("type"), True, True, added=added, at=a.get("addedAt"))
             tags = [t for t, on in (("invite-only", b.get("inviteOnly")), ("KYC", b.get("kyc")),
                                     ("boost", b.get("endDate"))) if on]
             out[slug] = program(b.get("project") or slug, f"https://immunefi.com/bug-bounty/{slug}/", state,
                                 mx > 0, money(mx) if mx else None, sig=b.get("updatedDate"), assets=assets,
-                                tags=tags)
+                                tags=tags, listed=b.get("launchDate"), updated=b.get("updatedDate"),
+                                added=added or None)
         book["etag"] = h.get("ETag")
         return out
 
@@ -628,7 +671,7 @@ class Cantina(Source):
                     b.get("name") or (b.get("company") or {}).get("name"), b.get("url"), state, pot > 0,
                     money(pot, b.get("currencyCode")) if pot else None, assets=assets, tags=tags,
                     contest=contest, window=when(t.get("start"), t.get("end")) if contest else None,
-                    date=t.get("start"))
+                    listed=t.get("start"))
         return out
 
 
@@ -654,12 +697,21 @@ class HackenProof(Source):
                 state = contest_state(r.get("start_date"), None, st == "completed")
             else:
                 state = "open" if st == "active" else ("closed" if st == "completed" else st or "open")
-            mx = _num(r.get("max_bounty"))
+            mx, lo, fee = _num(r.get("max_bounty")), _num(r.get("min_bounty")), _num(r.get("submission_cost"))
+            meta = {}
+            if r.get("min_reputation_points") is not None:  # 0 matters: "anyone can submit"
+                meta["rep"] = int(_num(r["min_reputation_points"]))
+            if fee:
+                meta["fee"] = money(fee)
+            if r.get("submitted_reports"):
+                meta["reports"] = r["submitted_reports"]
             out[r["slug"]] = program(
                 r.get("title"), f"https://hackenproof.com/programs/{r['slug']}", state, mx > 0,
                 money(mx) if mx else None, sig=f"{r.get('updated_at')}|{r.get('max_bounty')}",
                 tags=["KYC"] if r.get("kyc_required") else None, contest=audit,
-                window=when(r.get("start_date"), r.get("end_date")) if audit else None)
+                window=when(r.get("start_date"), r.get("end_date")) if audit else None,
+                listed=r.get("published_date") or r.get("start_date"), updated=r.get("updated_at"),
+                min_=money(lo) if lo else None, meta=meta or None)
         return out
 
     def detail(self, key, p):
@@ -688,13 +740,14 @@ class Sherlock(Source):
                 c.get("title"), f"https://audits.sherlock.xyz/contests/{c['id']}",
                 self.STATES.get(c.get("status"), str(c.get("status")).lower()), pot > 0,
                 money(pot, c.get("token")) if pot else None, tags=tags, contest=True,
-                window=when(c.get("starts_at"), c.get("ends_at")))
+                window=when(c.get("starts_at"), c.get("ends_at")), listed=c.get("starts_at"))
         for b in get_json(f"{self.API}/bug_bounties?page=1&per_page=100", timeout=60).get("items") or []:
             pay = _num(b.get("payout"))
             out[f"b{b['id']}"] = program(
                 b.get("title"), f"https://audits.sherlock.xyz/bug-bounties/{b['id']}",
                 "open" if b.get("is_ready", True) else "paused", pay > 0,
-                money(pay, b.get("display_currency")) if pay else None, sig=b.get("last_updated"))
+                money(pay, b.get("display_currency")) if pay else None, sig=b.get("last_updated"),
+                updated=b.get("last_updated"))
         return out
 
     def detail(self, key, p):
@@ -738,7 +791,7 @@ class Code4rena(Source):
             out[a["uid"]] = program(
                 a.get("title") or (a.get("org") or {}).get("name"), f"https://code4rena.com/audits/{a['slug']}", st,
                 _num(amt.split(" in ")[0]) > 0, amt.split(" in ")[0] or None, assets=assets, tags=tags, contest=True,
-                window=when(a.get("startTime"), a.get("endTime")), date=a.get("startTime"))
+                window=when(a.get("startTime"), a.get("endTime")), listed=a.get("startTime"))
         return out
 
 
@@ -762,7 +815,7 @@ class CodeHawks(Source):
                     c.get("name"), f"https://codehawks.cyfrin.io/c/{c.get('urlSlug')}",
                     contest_state(c.get("startDate"), c.get("endDate"), bool(c.get("finalised"))), pot > 0, prize,
                     assets={f"source_code|{c['githubUrl']}": [True, pot > 0, None]} if c.get("githubUrl") else None,
-                    tags=tags, contest=True, window=when(c.get("startDate"), c.get("endDate")), date=c.get("startDate"))
+                    tags=tags, contest=True, window=when(c.get("startDate"), c.get("endDate")), listed=c.get("startDate"))
         return out
 
 
@@ -785,7 +838,8 @@ class Standoff(Source):
             vendor = (r.get("vendor") or {}).get("name")
             name = r.get("name") if not vendor or vendor.lower() in str(r.get("name")).lower() else f"{vendor} {r.get('name')}"
             out[r["slug"]] = program(name, f"https://bugbounty.standoff365.com/en-US/programs/{r['slug']}", state,
-                                     rub > 0, money(rub, "RUB") if rub else None, sig=r.get("updatedAt"), tags=tags)
+                                     rub > 0, money(rub, "RUB") if rub else None, sig=r.get("updatedAt"), tags=tags,
+                                     listed=r.get("publishedAt") or r.get("createdAt"), updated=r.get("updatedAt"))
         return out
 
 
@@ -815,7 +869,7 @@ class IssueHunt(Source):
                 out[r["id"]] = program(org or r.get("name"), f"https://issuehunt.io/programs/{r.get('slug') or r['id']}",
                                        state, paid and mx > 0, money(mx, "JPY") if mx else None, assets=assets,
                                        tags=["application"] if r.get("visibility") == "application" else None,
-                                       date=r.get("firstActivated"))
+                                       listed=r.get("firstActivated"))
             if len(rows) < int(d.get("perPage") or 100):
                 return out
             page += 1
@@ -860,7 +914,7 @@ class BugBase(Source):
                 r.get("programName"), f"https://bugbase.ai/programs/{r['programUsername']}",
                 "open" if r.get("isAcceptingBugs") else "paused", paid, money(mx) if paid else None,
                 sig=hashlib.sha1(json.dumps([r.get("scopeGroups"), r.get("bountyVals")], sort_keys=True,
-                                            default=str).encode()).hexdigest()[:12], date=r.get("createdAt"))
+                                            default=str).encode()).hexdigest()[:12], listed=r.get("createdAt"))
         return out
 
     def detail(self, key, p):
@@ -892,7 +946,7 @@ class Huntr(Source):
             out[c["id"]] = program(c.get("title"), f"https://huntr.com/challenges/{c['id']}/v1/rules",
                                    {"closed": "ended"}.get(stage, stage), pot > 0, money(pot) if pot else None,
                                    contest=True, window=when(c.get("start_date"), c.get("end_date")),
-                                   date=c.get("start_date"))
+                                   listed=c.get("start_date"))
         if not out:
             raise RuntimeError("no challenges parsed from the RSC payload (page format changed?)")
         return out
@@ -1046,7 +1100,7 @@ def summary(p):
 def event(src, p, kind, prio, what, lines, emoji):
     if len(lines) > MAX_LINES:
         lines = lines[:MAX_LINES - 1] + [f"… and {len(lines) - MAX_LINES + 1} more"]
-    return {"kind": kind, "prio": prio, "url": p.get("url"), "tag": src.name,
+    return {"kind": kind, "prio": prio, "url": p.get("url"), "tag": src.name, "name": p["name"], "what": what,
             "title": f"{emoji} {p['name']} · {src.label} — {what}",
             "body": "\n".join(lines + ["", summary(p)])}
 
@@ -1067,7 +1121,7 @@ def new_event(src, key, p):
     return event(src, p, "NEW", prio, f"new {'contest' if p.get('contest') else 'program'}", lines, "🆕")
 
 
-def diff_program(src, key, o, p, now_iso=None):
+def diff_program(src, key, o, p, now_iso=None, adds=None):
     kinds, lines = [], []
     live = p["state"] in LIVE
     oa, pa = o.get("assets"), p.get("assets")
@@ -1081,6 +1135,8 @@ def diff_program(src, key, o, p, now_iso=None):
         if fresh or now_paid:
             if now_iso:
                 p["scope_changed"] = now_iso  # assets added/became eligible — the catalog's "new scope" date
+            if adds is not None:
+                adds += [(k, "added") for k in fresh] + [(k, "paid") for k in now_paid]
             hot = any(paid(pa[k], p) for k in fresh + now_paid)
             what = plural(len(fresh), "new target") if fresh else plural(len(now_paid), "target") + " now paid"
             kinds.append(((4 if hot else 3) if live else 2, "SCOPE", what, "🔭"))
@@ -1135,6 +1191,7 @@ def diff_source(src, prev, new, book):
         if o is None:
             p["first_seen"] = now_iso  # when bbwatch first saw it — the catalog's "added" date
             events.append(new_event(src, k, p))
+            note_targets(src, k, p, [(a, "new") for a, v in (p.get("assets") or {}).items() if v[0]], now_iso)
             continue
         if o.get("first_seen"):  # a fresh poll record has none; carry the originals forward
             p["first_seen"] = o["first_seen"]
@@ -1142,10 +1199,24 @@ def diff_source(src, prev, new, book):
             p["scope_changed"] = o["scope_changed"]
         if p.get("assets") is None and o.get("assets") is not None:  # unknown scope never erases a known one
             p["assets"] = o["assets"]
-        e = diff_program(src, k, o, p, now_iso)
+        adds = []
+        e = diff_program(src, k, o, p, now_iso, adds)
         if e:
             events.append(e)
+        note_targets(src, k, p, adds, now_iso)
     return merged, events
+
+
+PENDING_TARGETS = []  # rows for the targets log, filled by diff_source, flushed by deliver (main thread only)
+
+
+def note_targets(src, key, p, adds, ts):
+    pa = p.get("assets") or {}
+    for k, why in adds[:TARGETS_PER_PROGRAM]:
+        typ, _, ident = k.partition("|")
+        PENDING_TARGETS.append({"ts": ts, "src": src.name, "key": key, "name": p["name"], "url": p.get("url"),
+                                "asset": ident, "type": typ, "paid": bool(k in pa and paid(pa[k], p)),
+                                "why": why, "max": p.get("max")})
 
 
 # ---------- merging one source's poll ----------
@@ -1178,10 +1249,19 @@ def process(src, progs, err, dt, state, by_name):
         else:
             reconcile(state, progs, by_name)
         return events
+    rebased = book.pop("rebase", None)
     if not book.get("baselined"):
         slot["programs"], book["baselined"] = progs, True
         log(f"{src.label}: baseline {len(progs)} programs ({dt:.1f}s)")
         return events
+    if rebased:
+        # A sustained shrink is a listing change, not N separate closures: drop the vanished programs
+        # silently and say so once, instead of one "no longer listed" push per program.
+        slot["programs"] = {k: v for k, v in slot["programs"].items() if k in progs}
+        book["missing"] = {}
+        events.append(health(f"⚠️ bbwatch: {src.label} listing shrank",
+                             f"{rebased} → {len(progs)} programs, and it stayed that way: new baseline.",
+                             2, "warning"))
     slot["programs"], evs = diff_source(src, slot["programs"], progs, book)
     log(f"{src.label}: {len(progs)} programs, {len(evs)} events ({dt:.1f}s)")
     return events + evs
@@ -1259,6 +1339,8 @@ def record_changes(events):
                 "tag": e.get("tag"),
                 "url": e.get("url"),
                 "title": e.get("title"),
+                "name": e.get("name"),
+                "what": e.get("what"),
                 "body": (e.get("body") or "")[:600],
             })
         doc["entries"] = entries[:CHANGES_KEEP]
@@ -1269,6 +1351,30 @@ def record_changes(events):
         os.replace(CHANGES_FILE + ".tmp", CHANGES_FILE)
     except Exception as e:  # never fatal
         log(f"change log write failed: {e}")
+
+
+def record_targets():
+    """Flush PENDING_TARGETS into the rolling targets log (newest first). Best-effort, like the change log."""
+    if not PENDING_TARGETS:
+        return
+    rows = PENDING_TARGETS[:]
+    PENDING_TARGETS.clear()
+    try:
+        doc = {"generated": None, "entries": []}
+        if os.path.exists(TARGETS_FILE):
+            with open(TARGETS_FILE) as f:
+                doc = json.load(f)
+        entries = doc.get("entries") or []
+        seen = {(e.get("src"), e.get("key"), e.get("asset"), e.get("why")) for e in entries}
+        fresh = [r for r in rows if (r["src"], r["key"], r["asset"], r["why"]) not in seen]
+        doc["entries"] = (fresh[::-1] + entries)[:TARGETS_KEEP]
+        doc["generated"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(TARGETS_FILE + ".tmp", "w") as f:
+            json.dump(doc, f, ensure_ascii=False)
+        os.replace(TARGETS_FILE + ".tmp", TARGETS_FILE)
+    except Exception as e:  # never fatal
+        log(f"targets log write failed: {e}")
 
 
 def deliver(state, events):
@@ -1298,6 +1404,7 @@ def deliver(state, events):
         keep.append(m)
     state["outbox"] = keep[-100:]
     record_changes(events)
+    record_targets()
     return len(fresh)
 
 
@@ -1476,7 +1583,8 @@ def main():
             pushed = deliver(state, events + evs)
             events.clear()
             save_state(state)
-            if pushed or time.time() - last_sync >= SYNC_EVERY:
+            since = time.time() - last_sync
+            if pushed or since >= SYNC_EVERY or (evs and since >= SYNC_ON_CHANGE):
                 sync_state()
                 last_sync = time.time()
         except Exception as e:  # never let one bad merge kill the watcher
