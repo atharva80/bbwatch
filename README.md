@@ -113,6 +113,12 @@ straight from the `state` branch, so it is as fresh as the watcher's last sync
   new programs, scope additions, assets that became bounty-eligible. H1 and
   Immunefi publish per-asset dates, so their history is exact; every platform's
   additions are logged by the watcher as it sees them.
+- **Program drawer** — click any program (or its name in the feeds) for its full
+  scope, newest-updated target first (H1/Immunefi per-target timestamps, else when
+  bbwatch saw it added), its reward table, and a "by tier" grouping where the
+  program tiers its targets: H1 bounty-table rows and severity caps, Bugcrowd target
+  groups, Intigriti tiers, Cantina groups, Immunefi asset types, YesWeHack asset
+  value, HackenProof criticality. Each drawer loads one ~25 KB scope shard on demand.
 - **Activity** — the change log (new / reopened / paused / scope / bounty changes).
 - **Contests** — live, upcoming, judging and recently ended.
 - **Sources** — per-platform health.
@@ -125,7 +131,8 @@ Intigriti `createdAt`, HackenProof `published_date`, …); Bugrap and YesWeHack
 publish none, so theirs is the day bbwatch first saw the program.
 
 Data files on the `state` branch, rebuilt by `sync-state.sh` on every sync:
-`catalog.json` (programs), `latest.json` (Latest targets), next to the watcher's
+`catalog.json` (programs), `latest.json` (Latest targets), `scope-00…31.json`
+(every program's full scope, split by CRC-32 of the program id), next to the watcher's
 `status.json`, `changes.json` and `targets.json`. The keeper deploys the app with
 a snapshot of them under `data/`, used only if the live fetch fails.
 

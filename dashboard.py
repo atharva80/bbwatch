@@ -6,7 +6,7 @@ from the `state` branch (raw.githubusercontent.com), so it is as fresh as the
 watcher's last sync whatever the keeper's schedule does; the copies deployed with
 the page under data/ are only a fallback for when that fetch fails.
 
-    python3 dashboard.py data --state-dir .state      # write catalog.json + latest.json next to the state
+    python3 dashboard.py data --state-dir .state      # catalog.json, latest.json, scope-NN.json next to the state
     python3 dashboard.py site --state-dir .state --out dist   # the Pages artifact: index.html + data/
 
 `data` runs from sync-state.sh on every state sync; `site` runs in keeper.yml.
@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(HERE, "web")
@@ -59,6 +60,13 @@ DEAD = {"ended", "closed", "suspended", "archived", "finished"}
 LATEST_DAYS = 90       # Latest targets looks back this far
 LATEST_KEEP = 8000
 SCOPE_SAMPLE = 8       # identifiers per live program kept for search and the card preview
+# A program's full scope lives in one of NSHARD files the page fetches only when the program is opened,
+# so the catalog stays small: ~70k assets split 32 ways is a few dozen KB per click.
+NSHARD = 32
+# What an asset's severity field means where the platform has no explicit tiers.
+SEV_TIER = {"h1": "Max severity", "ywh": "Asset value", "hackenproof": "Criticality"}
+IMMUNEFI_TYPES = {"smart_contract": "Smart contracts", "websites_and_applications": "Websites & apps",
+                  "blockchain_dlt": "Blockchain / DLT"}
 
 
 # ---------- parsing helpers ----------
@@ -137,6 +145,21 @@ def type_cat(typ, ident=""):
     if cat == "other" and str(ident).startswith("0x"):
         return "contract"
     return cat
+
+
+def shard(pid):
+    return zlib.crc32(pid.encode()) % NSHARD
+
+
+def tier_name(plat, label):
+    s = " ".join(str(label or "").split())
+    if not s:
+        return ""
+    if set(s) <= {"█", " "}:
+        return "Hidden group"  # Bugcrowd redacts private group names for logged-out visitors
+    if plat == "immunefi":
+        return IMMUNEFI_TYPES.get(s, s.replace("_", " ").capitalize())
+    return s
 
 
 # ---------- loading ----------
@@ -222,6 +245,7 @@ def build_catalog(state):
                 "U": max(updated, first),          # last activity: platform update, scope growth, discovery
                 "S": ts(r.get("scope_changed")),
                 "F": first,
+                "sh": shard(f"{plat}:{key}"),
             })
     out.sort(key=lambda r: (-r["L"], r["n"].lower()))
     return out
@@ -284,6 +308,54 @@ def build_latest(state, targets, catalog):
     return out
 
 
+# ---------- full scope, per program ----------
+
+def build_scope(state, targets):
+    """Every asset of every program with its tier and freshest date, sharded for on-demand loading.
+
+    Row: [identifier, category, raw type, in scope, bounty-eligible, severity, tier, date, date kind]
+    where the date is the newest of the platform's per-asset updated/added stamps and the moment the
+    watcher saw the asset appear, and the kind says which it is: u(pdated) a(dded) s(een) or "".
+    """
+    seen = {}
+    for e in (targets or {}).get("entries") or []:
+        k, t = (e.get("src"), e.get("key"), e.get("asset")), ts(e.get("ts"))
+        if t > seen.get(k, 0):
+            seen[k] = t
+    shards = [{} for _ in range(NSHARD)]
+    for plat, src in ((state or {}).get("sources") or {}).items():
+        if plat == "mirror" or not isinstance(src, dict):
+            continue
+        for key, r in (src.get("programs") or {}).items():
+            if not isinstance(r, dict):
+                continue
+            rtab = r.get("rtab") or []
+            rows_by_id = {row[5]: row[0] for row in rtab if len(row) > 5}   # H1 tiers are bounty-table rows
+            tiers, added, aupd = r.get("tier") or {}, r.get("added") or {}, r.get("aupd") or {}
+            rows = []
+            for k, a in (r.get("assets") or {}).items():
+                typ, _, ident = k.partition("|")
+                u, ad, sn = ts(aupd.get(k)), ts(added.get(k)), seen.get((plat, key, ident), 0)
+                best = max(u, ad, sn)
+                kind = ("u" if best == u else "a" if best == ad else "s") if best else ""
+                tier = tiers.get(k, "")
+                tier = rows_by_id.get(tier, "") if rows_by_id else tier_name(plat, tier)
+                if not tiers and a[2]:
+                    tier = str(a[2]).capitalize()  # the severity cap / asset value is the tier
+                paid = 1 if (a[1] is True or (a[1] is None and r.get("bounty"))) else 0
+                rows.append([ident, type_cat(typ, ident), typ, 1 if a[0] else 0, paid,
+                             str(a[2] or "").lower(), tier, best, kind])
+            rows.sort(key=lambda x: (-x[7], -x[3], -x[4], x[0].lower()))
+            entry = {"a": rows}
+            if rtab:
+                entry["rt"] = [[tier_name(plat, row[0])] + list(row[1:5]) for row in rtab]
+            tk = "Tier" if tiers else SEV_TIER.get(plat, "") if any(x[5] for x in rows) else ""
+            if tk:
+                entry["tk"] = tk
+            shards[shard(f"{plat}:{key}")][f"{plat}:{key}"] = entry
+    return shards
+
+
 # ---------- writing ----------
 
 def write_json(path, doc):
@@ -303,7 +375,9 @@ def build_data(state_dir, out_dir):
         write_json(os.path.join(out_dir, "catalog.json"),
                    {"generated": stamp, "updated": updated, "labels": LABELS, "programs": catalog})
         write_json(os.path.join(out_dir, "latest.json"), {"generated": stamp, "updated": updated, "entries": latest})
-    print(f"data: {len(catalog)} programs, {len(latest)} latest targets -> {out_dir}")
+        for i, progs in enumerate(build_scope(state, targets)):
+            write_json(os.path.join(out_dir, f"scope-{i:02d}.json"), {"updated": updated, "programs": progs})
+    print(f"data: {len(catalog)} programs, {len(latest)} latest targets, {NSHARD} scope shards -> {out_dir}")
     return status, changes
 
 

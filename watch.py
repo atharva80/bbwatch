@@ -205,7 +205,8 @@ def _num(v):
 #           or None when the scope is not known (never diffed, never erases)
 
 def program(name, url, state, bounty, max_=None, sig=None, assets=None, tags=None, ref=None,
-            contest=False, window=None, listed=None, updated=None, min_=None, meta=None, added=None):
+            contest=False, window=None, listed=None, updated=None, min_=None, meta=None, added=None,
+            aupd=None, tier=None, rtab=None):
     p = {"name": " ".join(str(name or "?").split()), "url": url, "state": state, "bounty": bool(bounty),
          "max": max_, "sig": sig, "assets": assets}
     if tags:
@@ -217,11 +218,25 @@ def program(name, url, state, bounty, max_=None, sig=None, assets=None, tags=Non
     if window:
         p["when"] = window  # shown in messages, never diffed
     # Presentation only, never diffed: when the platform listed it, last updated it, the low end of
-    # its reward range, small facts a hunter filters on (rep, fee, reports…), per-asset added dates.
-    for field, val in (("listed", listed), ("updated", updated), ("min", min_), ("meta", meta), ("added", added)):
-        if val not in (None, "", {}):
+    # its reward range, small facts a hunter filters on (rep, fee, reports…), per-asset added/updated
+    # dates, per-asset tier labels and the program's reward table. An explicitly empty tier/rtab is
+    # kept, so a program that dropped its tiers doesn't inherit the old ones from the previous poll.
+    for field, val in (("listed", listed), ("updated", updated), ("min", min_), ("meta", meta), ("added", added),
+                       ("aupd", aupd), ("tier", tier), ("rtab", rtab)):
+        if val is not None and val != "" and (val != {} or field in ("tier", "rtab")):
             p[field] = val
     return p
+
+
+def money_range(lo, hi, cur="USD"):
+    """"$3,800 – $8,000", "$8,000" or "" for a reward-table cell."""
+    lo, hi = _num(lo) if lo not in (None, "") else 0, _num(hi) if hi not in (None, "") else 0
+    if hi and lo and lo != hi:
+        return f"{money(lo, cur)} – {money(hi, cur)}"
+    return money(hi or lo, cur) if (hi or lo) else ""
+
+
+SEVERITIES = ("critical", "high", "medium", "low")
 
 
 TEST_LISTING = re.compile(r"^\s*\[?\s*test\b", re.I)
@@ -286,7 +301,7 @@ class Source:
         for k, p in progs.items():  # fields only a rotated detail fetch fills survive polls that skip it
             o = prev.get(k)
             if o is not None:
-                for f in ("listed", "updated", "added"):
+                for f in ("listed", "updated", "added", "aupd", "tier", "rtab"):
                     if f not in p and o.get(f):
                         p[f] = o[f]
         if self.detail is None:
@@ -334,7 +349,7 @@ def _b64(n):
 
 class HackerOne(Source):
     name, label = "h1", "H1"
-    FIELDS = "asset_identifier asset_type eligible_for_submission eligible_for_bounty max_severity created_at"
+    FIELDS = "asset_identifier asset_type eligible_for_submission eligible_for_bounty max_severity created_at updated_at"
     # All public teams, open or not, so pauses and re-opens show up as status
     # changes instead of fake removals/new programs. ASC keeps page offsets
     # stable while new programs are appended at the end.
@@ -346,6 +361,7 @@ class HackerOne(Source):
     nodes {
       handle name offers_bounties submission_state launched_at started_accepting_at currency
       minimum_bounty_table_value maximum_bounty_table_value resolved_report_count response_efficiency_percentage
+      bounty_table { bounty_table_rows(first: 10) { nodes { id low medium high critical } } }
       structured_scopes(first: 100, archived: false) { total_count pageInfo { hasNextPage } nodes { %s } }
     }
   }
@@ -355,6 +371,15 @@ class HackerOne(Source):
     structured_scopes(first: 1000, after: $after, archived: false) { pageInfo { endCursor hasNextPage } nodes { %s } }
   }
 }""" % FIELDS
+
+    # Which bounty-table row (tier) each asset pays from. Only programs with several rows need it, and
+    # it is too heavy for the 45 s listing, so those few programs are fetched a handful per poll.
+    TIERS = """query($handle: String!) {
+  team(handle: $handle) {
+    structured_scopes(first: 1000, archived: false) { nodes { asset_identifier asset_type bounty_table_rows(first: 1) { nodes { id } } } }
+  }
+}"""
+    TIER_ROTATE = 6
 
     every = 45
     BIG_ROTATE = 8  # >100-scope teams fully refetched per poll even when their scope count is unchanged
@@ -414,7 +439,7 @@ class HackerOne(Source):
             o = prev.get(n["handle"])
             if (o and o.get("assets") is not None and o.get("sig") == n["structured_scopes"]["total_count"]
                     and n["handle"] not in pick):
-                n["reuse"], n["reuse_added"] = o["assets"], o.get("added")
+                n["reuse"], n["reuse_added"], n["reuse_aupd"] = o["assets"], o.get("added"), o.get("aupd")
             else:
                 refetch.append(n)
         with ThreadPoolExecutor(8) as ex:
@@ -423,26 +448,65 @@ class HackerOne(Source):
         out = {}
         for n in nodes:
             ss = n["structured_scopes"]
-            assets, added = n.get("reuse"), n.get("reuse_added")
+            assets, added, aupd = n.get("reuse"), n.get("reuse_added"), n.get("reuse_aupd")
             # H1 sometimes returns timed-out blank scopes: treat the team's scope as unknown
             if assets is None and all(s and s.get("asset_identifier") for s in ss["nodes"]) \
                     and not ss["pageInfo"]["hasNextPage"]:
-                assets, added = {}, {}
+                assets, added, aupd = {}, {}, {}
                 for s in ss["nodes"]:
-                    add_asset(assets, s["asset_identifier"], s["asset_type"], s["eligible_for_submission"],
-                              s["eligible_for_bounty"], s["max_severity"], added, s.get("created_at"))
+                    k = add_asset(assets, s["asset_identifier"], s["asset_type"], s["eligible_for_submission"],
+                                  s["eligible_for_bounty"], s["max_severity"], added, s.get("created_at"))
+                    if k and s.get("updated_at") and s["updated_at"] != s.get("created_at"):
+                        aupd[k] = s["updated_at"]
             state = {"disabled": "closed"}.get(n["submission_state"], n["submission_state"])
             cur = n.get("currency") or "usd"
             lo, hi = n.get("minimum_bounty_table_value"), n.get("maximum_bounty_table_value")
             meta = {k: v for k, v in (("reports", n.get("resolved_report_count")),
                                       ("resp", n.get("response_efficiency_percentage"))) if v}
+            rows = sorted(((n.get("bounty_table") or {}).get("bounty_table_rows") or {}).get("nodes") or [],
+                          key=lambda r: -(r.get("critical") or r.get("high") or r.get("medium") or r.get("low") or 0))
+            rtab = [[f"Tier {i}" if len(rows) > 1 else "All in-scope assets"]
+                    + [money(r[sv], cur) if r.get(sv) else "" for sv in SEVERITIES] + [r["id"]]
+                    for i, r in enumerate(rows, 1)]
             out[n["handle"]] = program(n["name"], f"https://hackerone.com/{n['handle']}", state,
                                        n["offers_bounties"], money(hi, cur) if hi else None, sig=ss["total_count"],
                                        assets=assets, listed=n.get("launched_at") or n.get("started_accepting_at"),
-                                       min_=money(lo, cur) if lo else None, meta=meta or None, added=added or None)
+                                       min_=money(lo, cur) if lo else None, meta=meta or None, added=added or None,
+                                       aupd=aupd or None, rtab=rtab)
+            if len(rows) <= 1:
+                out[n["handle"]]["tier"] = {}  # one table for everything: no per-asset tier
+        self.fetch_tiers(out, prev, book)
         if len(out) < 0.9 * total:
             raise RuntimeError(f"partial listing: {len(out)}/{total}")
         return out
+
+    def fetch_tiers(self, out, prev, book):
+        """Refresh per-asset tier rows for multi-tier programs: those never fetched first, then a rotation."""
+        multi = sorted(h for h, p in out.items() if len(p.get("rtab") or []) > 1)
+        if not multi:
+            return
+        rot = book.get("tier_rot", 0) % len(multi)
+        book["tier_rot"] = rot + self.TIER_ROTATE
+        pick = [h for h in multi if not (prev.get(h) or {}).get("tier")][:self.TIER_ROTATE]
+        pick += [h for h in (multi + multi)[rot:rot + self.TIER_ROTATE] if h not in pick]
+        with ThreadPoolExecutor(4) as ex:
+            for h, tiers in zip(pick, ex.map(self.scope_tiers, pick)):
+                if tiers is not None:
+                    out[h]["tier"] = tiers
+
+    def scope_tiers(self, handle):
+        try:
+            nodes = self.gql(self.TIERS, {"handle": handle})["team"]["structured_scopes"]["nodes"]
+        except Exception as e:
+            log(f"H1: tier fetch failed for {handle}: {e}")
+            return None
+        tiers = {}
+        for s in nodes:
+            row = ((s.get("bounty_table_rows") or {}).get("nodes") or [None])[0]
+            ident = str(s.get("asset_identifier") or "").strip()
+            if row and ident:
+                tiers[f"{str(s.get('asset_type') or 'other').strip().lower()}|{ident}"] = row["id"]
+        return tiers
 
     def all_scopes(self, n):
         """Refetch a big team's whole scope in pages of 1000 (usually one call); failure = unknown scope."""
@@ -494,17 +558,24 @@ class Bugcrowd(Source):
         if stamps:  # Bugcrowd's only dates: first published brief ≈ listing, newest = last scope update
             p["listed"], p["updated"] = stamps[0], stamps[-1]
         latest = next((c for c in logs if c.get("changelogState") == "Latest"), logs[0] if logs else None)
-        if latest is None or (latest["id"] == p.get("ver") and p.get("assets") is not None):
+        if latest is None or (latest["id"] == p.get("ver") and p.get("assets") is not None and "tier" in p):
             return
         brief = get_json(f"{base}/changelog/{latest['id']}.json")["data"]
-        assets = {}
+        assets, tiers, rtab = {}, {}, []
         for g in brief.get("scope") or []:
             in_scope = bool(g.get("inScope"))
-            paid = in_scope and any((v or {}).get("max") for v in (g.get("rewardRangeData") or {}).values())
+            rr = g.get("rewardRangeData") or {}
+            paid = in_scope and any((v or {}).get("max") for v in rr.values())
+            group = " ".join(str(g.get("name") or "").split())
+            if paid and group:  # P1..P4 = critical..low
+                rtab.append([group] + [money_range((rr.get(str(i)) or {}).get("min"), (rr.get(str(i)) or {}).get("max"))
+                                       for i in (1, 2, 3, 4)])
             for t in g.get("targets") or []:
-                add_asset(assets, t.get("uri") or t.get("name") or t.get("ipAddress"), t.get("category"),
-                          in_scope, paid)
-        p["assets"], p["ver"] = assets, latest["id"]
+                k = add_asset(assets, t.get("uri") or t.get("name") or t.get("ipAddress"), t.get("category"),
+                              in_scope, paid)
+                if k and group and in_scope:
+                    tiers[k] = group
+        p["assets"], p["ver"], p["tier"], p["rtab"] = assets, latest["id"], tiers, rtab
 
 
 class Intigriti(Source):
@@ -514,6 +585,7 @@ class Intigriti(Source):
     STATUS = ["_", "wizard", "draft", "open", "suspended", "closing", "closed", "archived"]
     CONF = ["_", "invite-only", "application", "registered", "public"]
     TYPES = ["_", "url", "android", "ios", "iprange", "device", "other", "wildcard"]
+    TIER = {1: "No bounty", 2: "Tier 3", 3: "Tier 2", 4: "Tier 1"}
     ALGOLIA = ("https://aazuksyar4-dsn.algolia.net/1/indexes/*/queries"
                "?x-algolia-api-key=70d8a3400477311f27ce002ec953aeb0&x-algolia-application-id=AAZUKSYAR4")
 
@@ -540,12 +612,32 @@ class Intigriti(Source):
         ch, hd = p["ref"]
         d = get_json(f"https://app.intigriti.com/api/core/public/programs/{q(ch)}/{q(hd)}")
         coll = max(d.get("assetsCollection") or [], key=lambda c: c.get("createdAt") or 0, default=None)
-        assets = {}
+        assets, tiers = {}, {}
         for t in ((coll or {}).get("content") or {}).get("assetsAndGroups") or []:
             for a in (t["assets"] if "assets" in t else [t]):
                 tier = a.get("bountyTierId")  # 1 no bounty, 2-4 tier 3..1, 5 out of scope
-                add_asset(assets, a.get("name"), _at(self.TYPES, a.get("typeId")), tier != 5, tier in (2, 3, 4))
-        p["assets"] = assets
+                k = add_asset(assets, a.get("name"), _at(self.TYPES, a.get("typeId")), tier != 5, tier in (2, 3, 4))
+                if k and tier in self.TIER:
+                    tiers[k] = self.TIER[tier]
+        # bounty table per tier, amounts per CVSS band: 9.0+ critical, 7.0 high, 4.0 medium, below that low
+        table = max(d.get("bountyTables") or [], key=lambda c: c.get("createdAt") or 0, default=None)
+        content = (table or {}).get("content") or {}
+        rtab = []
+        for row in sorted(content.get("bountyRows") or [], key=lambda r: -(r.get("bountyTierId") or 0)):
+            if row.get("bountyTierId") not in (2, 3, 4):
+                continue
+            band = {sv: [] for sv in SEVERITIES}
+            for rg in row.get("bountyRanges") or []:
+                lo = rg.get("minScore") or 0
+                sv = "critical" if lo >= 9 else "high" if lo >= 7 else "medium" if lo >= 4 else "low"
+                band[sv] += [(rg.get("minBounty") or {}).get("value"), (rg.get("maxBounty") or {}).get("value")]
+            cells = []
+            for sv in SEVERITIES:
+                vals = [v for v in band[sv] if v]
+                cells.append(money_range(min(vals), max(vals), content.get("currency")) if vals else "")
+            if any(cells):
+                rtab.append([self.TIER[row["bountyTierId"]]] + cells)
+        p["assets"], p["tier"], p["rtab"] = assets, tiers, rtab
 
 
 class YesWeHack(Source):
@@ -613,15 +705,23 @@ class Immunefi(Source):
             if b.get("endDate") and b["endDate"] < now:
                 state = "ended"
             mx = b.get("maxBounty") or 0
-            assets, added = {}, {}
+            assets, added, tiers, cells = {}, {}, {}, {}
             for a in b.get("assets") or []:
-                add_asset(assets, a.get("url"), a.get("type"), True, True, added=added, at=a.get("addedAt"))
+                k = add_asset(assets, a.get("url"), a.get("type"), True, True, added=added, at=a.get("addedAt"))
+                if k and a.get("type"):
+                    tiers[k] = a["type"]
+            for r in b.get("rewards") or []:
+                cell = money_range(r.get("minReward"), r.get("maxReward"))
+                if not cell and r.get("rewardCalculationPercentage"):
+                    cell = f"{r['rewardCalculationPercentage']}% of funds at risk"
+                cells.setdefault(r.get("assetType") or "other", {})[str(r.get("severity") or "").lower()] = cell
+            rtab = [[at] + [c.get(sv, "") for sv in SEVERITIES] for at, c in cells.items() if any(c.values())]
             tags = [t for t, on in (("invite-only", b.get("inviteOnly")), ("KYC", b.get("kyc")),
                                     ("boost", b.get("endDate"))) if on]
             out[slug] = program(b.get("project") or slug, f"https://immunefi.com/bug-bounty/{slug}/", state,
                                 mx > 0, money(mx) if mx else None, sig=b.get("updatedDate"), assets=assets,
                                 tags=tags, listed=b.get("launchDate"), updated=b.get("updatedDate"),
-                                added=added or None)
+                                added=added or None, tier=tiers, rtab=rtab)
         book["etag"] = h.get("ETag")
         return out
 
@@ -653,20 +753,28 @@ class Cantina(Source):
                 st = str(b.get("status") or "").lower()
                 pot = _num(b.get("totalRewardPot"))
                 t = b.get("timeframe") or {}
-                assets = None
+                assets, tiers, rtab = None, {}, []
                 if b.get("assetGroups"):
                     assets = {}
 
                     def walk(groups):
                         for g in groups or []:
-                            paid = any(r.get("maxReward") not in (None, "", "0") for r in g.get("rewards") or [])
+                            paid = any(_num(r.get("maxReward")) for r in g.get("rewards") or [])
+                            group = " ".join(str(g.get("name") or "").split())
+                            if paid and group and not g.get("outOfScope"):
+                                rw = {str(r.get("severity") or "").lower(): r for r in g.get("rewards") or []}
+                                rtab.append([group] + [money_range((rw.get(sv) or {}).get("minReward"),
+                                                                   (rw.get(sv) or {}).get("maxReward"), b.get("currencyCode"))
+                                                       for sv in SEVERITIES])
                             for a in g.get("assets") or []:
                                 if a.get("hidden"):
                                     continue
                                 desc = str(a.get("description") or "").strip()
                                 ident = desc if desc.startswith(("http", "0x")) else (a.get("name") or desc)
-                                add_asset(assets, ident, guess_type(g.get("name"), ident), not g.get("outOfScope"),
-                                          paid or None)
+                                k = add_asset(assets, ident, guess_type(g.get("name"), ident), not g.get("outOfScope"),
+                                              paid or None)
+                                if k and group and not g.get("outOfScope"):
+                                    tiers[k] = group
                             walk(g.get("subGroups"))
                     walk(b["assetGroups"])
                 tags = (["private"] if str(b.get("kind", "")).startswith("private") else []) + \
@@ -679,7 +787,7 @@ class Cantina(Source):
                     b.get("name") or (b.get("company") or {}).get("name"), b.get("url"), state, pot > 0,
                     money(pot, b.get("currencyCode")) if pot else None, assets=assets, tags=tags,
                     contest=contest, window=when(t.get("start"), t.get("end")) if contest else None,
-                    listed=t.get("start"))
+                    listed=t.get("start"), tier=tiers, rtab=rtab)
         return out
 
 

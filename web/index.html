@@ -185,6 +185,43 @@ footer{color:var(--faint);font-size:12px;padding:28px 0 36px}
 footer a{color:var(--dim)}
 .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%) translateY(20px);opacity:0;background:var(--text);color:var(--bg);border-radius:9px;padding:8px 14px;font-size:13px;transition:.25s;pointer-events:none;z-index:9}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+/* program drawer */
+.card[data-id],tr[data-id]{cursor:pointer}
+.card[data-id]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.namebtn{border:0;background:none;padding:0;font:inherit;font-weight:600;color:var(--text);cursor:pointer;text-align:left}
+.namebtn:hover{color:var(--accent)}
+.d-bg{position:fixed;inset:0;background:rgba(8,12,18,.42);opacity:0;pointer-events:none;transition:opacity .18s;z-index:20}
+.d-bg.open{opacity:1;pointer-events:auto}
+.drawer{position:fixed;top:0;right:0;height:100%;width:min(660px,100vw);background:var(--panel);border-left:1px solid var(--line);box-shadow:-14px 0 36px rgba(0,0,0,.18);transform:translateX(102%);transition:transform .2s ease;z-index:21;display:flex;flex-direction:column}
+.drawer.open{transform:none}
+.d-close{position:absolute;top:12px;right:14px}
+.d-head{padding:16px 18px 13px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:7px}
+.d-head h2{margin:0 40px 0 0;font-size:19px;line-height:1.3;overflow-wrap:anywhere}
+.d-body{overflow-y:auto;padding:4px 18px 28px;flex:1;overscroll-behavior:contain}
+.d-sec{font-size:12px;font-weight:650;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;margin:18px 0 8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.d-sec .c{font-weight:500;text-transform:none;letter-spacing:0;color:var(--faint)}
+.d-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 6px}
+.d-tools input{flex:1 1 200px;min-width:0;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:7px 10px;font:inherit;font-size:13px;outline:none}
+.d-tools input:focus{border-color:var(--accent)}
+.rt{width:100%;border-collapse:collapse;font-size:12.5px}
+.rt th{font-size:11px;padding:6px 8px;text-transform:uppercase;letter-spacing:.03em}
+.rt td{padding:6px 8px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.rt th:not(:first-child),.rt td:not(:first-child){text-align:right}
+.rt td:first-child{white-space:normal;font-weight:550}
+.srow{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--line)}
+.srow:last-child{border-bottom:0}
+.srow .ty{margin-top:2px;flex:none}
+.srow .main{flex:1;min-width:0}
+.srow .id{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere;color:var(--text)}
+.srow .id a{color:var(--text)} .srow .id a:hover{color:var(--accent)}
+.srow .meta{display:flex;flex-wrap:wrap;gap:5px;margin-top:4px;font-size:11.5px}
+.srow time{font-size:11.5px;color:var(--faint);white-space:nowrap;margin-top:2px}
+.srow .pd{color:var(--good)} .srow .np{color:var(--faint)}
+.tier-h{display:flex;align-items:baseline;gap:8px;margin:14px 0 2px;font-size:13px;font-weight:650}
+.tier-h .c{font-weight:500;color:var(--faint);font-size:12px}
+.tier-h .rw{margin-left:auto;font-size:12px;color:var(--good);font-weight:600}
+.note{font-size:12px;color:var(--faint);margin-top:14px}
+body.locked{overflow:hidden}
 @media (max-width:640px){.brand small{display:none} .live span{display:none} .count{margin-left:0;width:100%}}
 </style>
 </head>
@@ -213,10 +250,20 @@ footer a{color:var(--dim)}
   <a href="https://github.com/atharva80/bbwatch" rel="noopener">Source</a>
 </footer>
 <div class="toast" id="toast"></div>
+<div class="d-bg" id="dbg"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="d-title" aria-hidden="true">
+  <button class="iconbtn d-close" id="dclose" aria-label="Close">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+  </button>
+  <div class="d-head" id="dhead"></div>
+  <div class="d-body" id="dbody"></div>
+</aside>
 
 <script>
 "use strict";
 const RAW = "https://raw.githubusercontent.com/atharva80/bbwatch/state/";
+const LOCAL = new URLSearchParams(location.search).has("local");  // ?local: preview a local build, skip the live feed
+const NSHARD = 32;
 const LIVE_STATES = new Set(["open", "active", "live"]);
 const DEAD_STATES = new Set(["ended", "closed", "suspended", "archived", "finished"]);
 const TYPE_LABEL = {web: "web", wildcard: "wildcard", api: "api", mobile: "mobile", contract: "smart contract",
@@ -231,7 +278,8 @@ const STALE_JUDGING = 90 * DAY;
 const contestState = r => r.s === "judging" && r.L && now - r.L > STALE_JUDGING ? "ended" : r.s;
 
 let D = {status: null, catalog: null, latest: null, changes: null, from: "live", labels: {}};
-let PROG = [], LATEST = [], CHANGES = [], BY_URL = new Map();
+let PROG = [], LATEST = [], CHANGES = [], BY_URL = new Map(), BY_ID = new Map(), PROG_BY_URL = new Map();
+const SHARDS = new Map();  // shard number -> Promise of {program id: scope}; dropped whenever new data arrives
 let now = Date.now() / 1000;
 
 /* ---------- small utilities ---------- */
@@ -300,7 +348,7 @@ const shown = {programs: 60, targets: 40, activity: 60};
 
 /* ---------- data ---------- */
 async function getJSON(name, bust){
-  const tries = [[RAW + name + "?v=" + encodeURIComponent(bust), "live"], ["data/" + name, "snapshot"]];
+  const tries = [[RAW + name + "?v=" + encodeURIComponent(bust), "live"], ["data/" + name, "snapshot"]].slice(LOCAL ? 1 : 0);
   for (const [url, from] of tries){
     try {
       const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 9000);
@@ -336,6 +384,9 @@ function index(){
     e._h = [e.name, e.what, e.title, e.body, e.tag, label(e.tag)].join(" ").toLowerCase();
     return e;
   });
+  BY_ID = new Map(PROG.map(r => [r.id, r]));
+  PROG_BY_URL = new Map(PROG.filter(r => r.u).map(r => [r.u, r]));
+  SHARDS.clear();
   BY_URL = new Map();
   for (const e of CHANGES) if (e.url) { if (!BY_URL.has(e.url)) BY_URL.set(e.url, []); BY_URL.get(e.url).push(e); }
 }
@@ -414,6 +465,11 @@ function emptyBox(title, text){ return `<div class="empty"><b>${title}</b>${text
 function showMore(view, total, onClick){
   if (shown[view] >= total) return "";
   return `<button class="showmore" id="more-${view}">Show ${Math.min(view === "programs" ? 60 : 40, total - shown[view])} more · ${(total - shown[view]).toLocaleString()} left</button>`;
+}
+
+function progLink(r, url, name){
+  if (r) return `<button class="namebtn" data-open="${esc(r.id)}">${esc(name || r.n)}</button>`;
+  return safeUrl(url) ? `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(name)}</a>` : esc(name);
 }
 
 /* ---------- Programs ---------- */
@@ -512,27 +568,22 @@ function programCard(r){
   if (r.m && r.m.reports) facts.push(`${r.m.reports.toLocaleString()} reports`);
   if (r.m && r.m.resp) facts.push(`${r.m.resp}% response`);
   if (last) facts.push(`<span class="hot">${esc(KIND_LABEL[last.kind] || last.kind)} ${ago(last.t)}</span>`);
-  const details = (r.sc && r.sc.length) || hist.length ? `<details class="more"><summary>Scope${hist.length ? " & history" : ""}</summary>
-      ${r.sc && r.sc.length ? `<ul class="scope">${r.sc.map(s => `<li><code>${esc(s)}</code></li>`).join("")}${r.na > r.sc.length ? `<li>… ${r.na - r.sc.length} more on the program page</li>` : ""}</ul>` : ""}
-      ${hist.length ? `<ul class="hist">${hist.map(e => `<li><time>${fmtDate(e.t, false)}</time>${esc(KIND_LABEL[e.kind] || e.kind)} — ${esc(e.what || "")}</li>`).join("")}</ul>` : ""}
-    </details>` : "";
   const dateTitle = r.Lw ? "First seen by bbwatch (the platform publishes no listing date)" : "Listed on the platform";
-  return `<article class="card${DEAD_STATES.has(r.s) ? " dead" : ""}">
+  return `<article class="card${DEAD_STATES.has(r.s) ? " dead" : ""}" data-id="${esc(r.id)}" tabindex="0" title="Open scope & details">
     <div class="c-top">${platChip(r.p)}${isNew(r) ? `<span class="badge-new">NEW</span>` : ""}<span class="st ${esc(r.s)}">${esc(r.s)}</span>
       ${r.L ? `<span class="c-date" title="${dateTitle}">${r.Lw ? "seen " : ""}${fmtDate(r.L)}</span>` : ""}</div>
-    <h3>${safeUrl(r.u) ? `<a href="${esc(r.u)}" target="_blank" rel="noopener">${esc(r.n)}</a>` : esc(r.n)}</h3>
+    <h3>${esc(r.n)}</h3>
     ${rw ? `<div class="reward">${rw}</div>` : `<div class="reward none">${r.b ? "Bounty · amount not published" : "No bounty (VDP)"}</div>`}
     ${r.ty.length ? `<div class="tags">${r.ty.map(typeChip).join("")}</div>` : ""}
     ${facts.length ? `<div class="facts">${facts.map(f => `<span>${f}</span>`).join("")}</div>` : ""}
     ${r.t && r.t.length ? `<div class="tags">${r.t.map(t => `<span class="t">${esc(t)}</span>`).join("")}</div>` : ""}
-    ${details}
   </article>`;
 }
 function programTable(rows){
   return `<div class="tablewrap"><table><thead><tr><th>Listed</th><th>Program</th><th class="num">Reward</th><th class="num">Targets</th><th>Scope</th><th>Updated</th></tr></thead><tbody>` +
-    rows.map(r => `<tr>
+    rows.map(r => `<tr data-id="${esc(r.id)}">
       <td class="nw">${r.L ? fmtDate(r.L) : "—"}${isNew(r) ? ` <span class="badge-new">NEW</span>` : ""}</td>
-      <td>${safeUrl(r.u) ? `<a href="${esc(r.u)}" target="_blank" rel="noopener">${esc(r.n)}</a>` : esc(r.n)}<div class="sub">${esc(label(r.p))} · ${esc(r.s)}${r.t && r.t.length ? " · " + esc(r.t.join(", ")) : ""}</div></td>
+      <td><span class="namebtn">${esc(r.n)}</span><div class="sub">${esc(label(r.p))} · ${esc(r.s)}${r.t && r.t.length ? " · " + esc(r.t.join(", ")) : ""}</div></td>
       <td class="num">${reward(r) || `<span class="sub">${r.b ? "—" : "VDP"}</span>`}</td>
       <td class="num">${r.na || "—"}</td>
       <td>${r.ty.map(typeChip).join(" ")}</td>
@@ -595,7 +646,7 @@ function targetResults(){
     const e = g.e, cap = 6;
     html += `<div class="group">
       <div class="g-head"><span class="why ${esc(e.w)}">${esc(WHY_LABEL[e.w] || e.w)}</span>${platChip(e.p)}
-        <span class="name">${safeUrl(e.u) ? `<a href="${esc(e.u)}" target="_blank" rel="noopener">${esc(e.n)}</a>` : esc(e.n)}</span>
+        <span class="name">${progLink(BY_ID.get(e.id), e.u, e.n)}</span>
         ${e.mx ? `<span class="st">up to ${esc(e.mx)}</span>` : ""}
         <time title="${new Date(g.t * 1000).toLocaleString()}">${fmtTime(g.t)}</time></div>
       <ul class="assets">${g.items.map((a, i) => `<li${i >= cap ? ' hidden data-x="1"' : ""}>${typeChip(a.c)}<code title="${esc(a.a)}">${esc(a.a)}</code>${a.$ ? `<span class="pd">bounty</span>` : `<span class="np">no bounty</span>`}</li>`).join("")}</ul>
@@ -653,7 +704,7 @@ function activityResults(){
     const health = e.kind === "HEALTH" || e.kind === "ARMED";
     html += `<div class="group">
       <div class="g-head"><span class="kind k-${esc(e.kind)}">${esc(KIND_LABEL[e.kind] || e.kind)}</span>${D.labels[e.tag] ? platChip(e.tag) : ""}
-        <span class="name">${health ? esc(e.title) : safeUrl(e.url) ? `<a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.name)}</a>` : esc(e.name)}</span>
+        <span class="name">${health ? esc(e.title) : progLink(PROG_BY_URL.get(e.url), e.url, e.name)}</span>
         ${!health && e.what ? `<span class="what">${esc(e.what)}</span>` : ""}
         <time title="${new Date(e.t * 1000).toLocaleString()}">${fmtTime(e.t)}</time></div>
       ${e.body ? `<details class="more"><summary>Details</summary><div class="body">${esc(e.body)}</div></details>` : ""}
@@ -713,6 +764,144 @@ function viewSources(){
     }).join("") + `</tbody></table></div>`;
 }
 
+/* ---------- program drawer ---------- */
+let PANEL = {id: null};
+// Which scope-NN.json holds a program: CRC-32 of its id, as dashboard.py's zlib.crc32 — computed here
+// so the drawer never depends on the catalog carrying the shard number.
+const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(str){ let c = 0xffffffff; for (const b of new TextEncoder().encode(str)) c = CRC[(c ^ b) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+const SEV_ORDER = {critical: 0, high: 1, medium: 2, low: 3, none: 4};
+const PLAIN_TYPES = new Set(["url", "website", "web", "domain", "wildcard", "api", "other", "smart_contract", "source_code",
+  "websites_and_applications", "web-application", "web_application", "cidr", "iprange"]);
+async function getShard(sh){
+  if (!SHARDS.has(sh)) {
+    const bust = (D.status && D.status.updated) || Date.now();
+    SHARDS.set(sh, getJSON(`scope-${String(sh).padStart(2, "0")}.json`, bust).then(([d]) => (d && d.programs) || null));
+  }
+  return SHARDS.get(sh);
+}
+function setOpenHash(id){
+  history.replaceState(null, "", "#" + current + (id ? "?open=" + encodeURIComponent(id) : ""));
+}
+async function openPanel(id, keep){
+  const r = BY_ID.get(id);
+  if (!r) return;
+  if (!keep) PANEL = {id, q: "", mode: "date", all: false, scope: null};
+  $("#drawer").classList.add("open"); $("#dbg").classList.add("open");
+  $("#drawer").setAttribute("aria-hidden", "false"); document.body.classList.add("locked");
+  setOpenHash(id);
+  panelHead(r);
+  if (!keep) $("#dbody").innerHTML = `<div class="skel" style="height:90px;margin-top:16px"></div><div class="skel" style="height:220px;margin-top:12px"></div>`;
+  const progs = await getShard(crc32(r.id) % NSHARD);
+  if (PANEL.id !== id) return;
+  PANEL.scope = (progs && progs[id]) || {a: [], missing: !progs};
+  panelBody(r);
+  if (!keep) $("#dclose").focus({preventScroll: true});
+}
+function closePanel(){
+  if (!PANEL.id) return;
+  PANEL = {id: null};
+  $("#drawer").classList.remove("open"); $("#dbg").classList.remove("open");
+  $("#drawer").setAttribute("aria-hidden", "true"); document.body.classList.remove("locked");
+  setOpenHash(null);
+}
+function panelHead(r){
+  const rw = reward(r);
+  const facts = [r.L ? `${r.Lw ? "first seen" : "listed"} ${fmtDate(r.L)}` : "", r.U && r.U !== r.L ? `updated ${ago(r.U)}` : "",
+    r.m && r.m.reports ? `${r.m.reports.toLocaleString()} reports` : "", r.m && r.m.resp ? `${r.m.resp}% response efficiency` : "",
+    r.c && r.w ? esc(r.w) : ""].filter(Boolean);
+  $("#dhead").innerHTML = `<div class="c-top">${platChip(r.p)}${isNew(r) ? `<span class="badge-new">NEW</span>` : ""}<span class="st ${esc(r.s)}">${esc(r.s)}</span></div>
+    <h2 id="d-title">${esc(r.n)}</h2>
+    ${rw ? `<div class="reward">${rw}</div>` : `<div class="reward none">${r.b ? "Bounty · amount not published" : "No bounty (VDP)"}</div>`}
+    ${facts.length ? `<div class="facts">${facts.map(f => `<span>${f}</span>`).join("")}</div>` : ""}
+    ${(r.t && r.t.length) || r.ty.length ? `<div class="tags">${r.ty.map(typeChip).join("")}${(r.t || []).map(t => `<span class="t">${esc(t)}</span>`).join("")}</div>` : ""}
+    ${safeUrl(r.u) ? `<div><a href="${esc(r.u)}" target="_blank" rel="noopener">Open on ${esc(label(r.p))} ↗</a></div>` : ""}`;
+}
+function tierRank(t){
+  const m = /tier\s*(\d+)/i.exec(t);
+  if (m) return +m[1];
+  const s = String(t).toLowerCase();
+  if (s in SEV_ORDER) return 100 + SEV_ORDER[s];
+  if (/primary/i.test(t)) return 50;
+  if (/secondary/i.test(t)) return 51;
+  if (/no bounty|out of scope|none/i.test(t)) return 900;
+  return 200;
+}
+function panelBody(r){
+  const sc = PANEL.scope, rows = sc.a || [], ws = words(PANEL.q);
+  const inScope = rows.filter(x => x[3]), out = rows.filter(x => !x[3]);
+  const paidN = inScope.filter(x => x[4]).length;
+  const tiers = [...new Set(inScope.map(x => x[6]).filter(Boolean))];
+  const byTier = PANEL.mode === "tier" && tiers.length > 1;
+  const oneTier = tiers.length === 1 && inScope.every(x => x[6] === tiers[0]) ? tiers[0] : "";
+  const tk = sc.tk || "";
+  const tierText = t => !t ? "" : tk && tk !== "Tier" ? `${tk.toLowerCase()}: ${t.toLowerCase()}` : t;
+  const rtRow = new Map((sc.rt || []).map(x => [x[0], x]));
+  const match = x => !ws.length || hit((x[0] + " " + x[2] + " " + x[6]).toLowerCase(), ws);
+  const row = x => {
+    const id = safeUrl(x[0]) ? `<a href="${esc(x[0])}" target="_blank" rel="noopener">${esc(x[0])}</a>` : esc(x[0]);
+    const when = x[7] ? `<time title="${x[8] === "s" ? "when bbwatch saw it added" : x[8] === "u" ? "last updated on the platform" : "added on the platform"} · ${new Date(x[7] * 1000).toLocaleString()}">${x[8] === "u" ? "updated" : x[8] === "a" ? "added" : "seen"} ${ago(x[7])}</time>` : "";
+    return `<div class="srow">${typeChip(x[1])}<div class="main"><div class="id">${id}</div>
+      <div class="meta">${x[3] ? (x[4] ? `<span class="pd">bounty</span>` : `<span class="np">no bounty</span>`) : ""}${x[6] && !byTier && !(x[3] && oneTier) ? `<span class="t">${esc(tierText(x[6]))}</span>` : ""}${x[2] && !PLAIN_TYPES.has(x[2]) && x[2] !== x[1] ? `<span class="np">${esc(x[2].replace(/_/g, " "))}</span>` : ""}</div></div>${when}</div>`;
+  };
+  let html = "";
+  // reward table: only the severity columns that have an amount somewhere
+  const rt = sc.rt || [], sevCols = [["Critical", 1], ["High", 2], ["Medium", 3], ["Low", 4]].filter(([, i]) => rt.some(x => x[i]));
+  if (rt.length && sevCols.length) {
+    html += `<div class="d-sec">Rewards${rt.length > 1 ? ` by ${tk === "Tier" ? "tier" : "group"}` : ""}</div>
+      <div class="tablewrap"><table class="rt"><thead><tr><th>${rt.length > 1 ? "Tier" : ""}</th>${sevCols.map(([h]) => `<th>${h}</th>`).join("")}</tr></thead><tbody>` +
+      rt.map(x => `<tr><td>${esc(x[0])}</td>${sevCols.map(([, i]) => `<td>${esc(x[i] || "—")}</td>`).join("")}</tr>`).join("") + `</tbody></table></div>`;
+  }
+  html += `<div class="d-sec">Scope <span class="c">${plural(inScope.length, "target")} in scope${r.b ? ` · ${paidN} bounty-eligible` : ""}${out.length ? ` · ${out.length} out of scope` : ""}${oneTier ? ` · all ${esc(tierText(oneTier))}` : ""}</span></div>`;
+  if (sc.missing) html += emptyBox("Scope could not be loaded", "The scope file did not answer — try again in a moment.");
+  else if (!rows.length) html += emptyBox("No structured scope", `${esc(label(r.p))} publishes this program's scope as prose only — see the program page.`);
+  else {
+    if (inScope.length > 6 || tiers.length > 1) {
+      html += `<div class="d-tools">${inScope.length > 6 ? `<input id="dq" type="search" placeholder="Filter ${inScope.length} targets…" value="${esc(PANEL.q)}" autocomplete="off">` : ""}
+        ${tiers.length > 1 ? `<div class="seg" role="group" aria-label="Order"><button id="dm-date" class="${byTier ? "" : "on"}">Latest updated</button><button id="dm-tier" class="${byTier ? "on" : ""}">By ${tk === "Tier" ? "tier" : esc(tk.toLowerCase())}</button></div>` : ""}</div>`;
+    }
+    const list = inScope.filter(match);
+    const cap = PANEL.all ? Infinity : 150;
+    if (!list.length) html += `<div class="note">No target matches “${esc(PANEL.q)}”.</div>`;
+    else if (byTier) {
+      const groups = new Map();
+      for (const x of list) { const k = x[6] || "Other"; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(x); }
+      let n = 0;
+      for (const [t, xs] of [...groups].sort((a, b) => tierRank(a[0]) - tierRank(b[0]) || b[1].length - a[1].length)) {
+        if (n >= cap) break;
+        const rr = rtRow.get(t), top = rr && rr.slice(1, 5).find(Boolean);
+        html += `<div class="tier-h">${esc(tierText(t) || t)}<span class="c">${xs.length}</span>${top ? `<span class="rw">up to ${esc(top.split(" – ").pop())}</span>` : ""}</div>`;
+        html += xs.slice(0, cap - n).map(row).join("");
+        n += xs.length;
+      }
+    } else html += list.slice(0, cap).map(row).join("");
+    if (list.length > cap) html += `<button class="showmore" id="dall">Show all ${list.length.toLocaleString()} targets</button>`;
+    if (out.length) html += `<details class="more" style="margin-top:14px"><summary>Out of scope · ${out.length}</summary>${out.filter(match).slice(0, 300).map(row).join("")}</details>`;
+    const dated = rows.filter(x => x[7]).length;
+    html += `<div class="note">${dated ? `Newest first by the platform's own added / updated time${dated < rows.length ? `; ${rows.length - dated} target${rows.length - dated === 1 ? " has" : "s have"} no date and ${rows.length - dated === 1 ? "is" : "are"} listed last` : ""}.` : `${esc(label(r.p))} publishes no per-target dates; targets bbwatch sees added from now on get one.`}</div>`;
+  }
+  const hist = (BY_URL.get(r.u) || []).filter(e => e.kind !== "HEALTH").slice(0, 8);
+  if (hist.length) html += `<div class="d-sec">Recent changes</div><ul class="hist">${hist.map(e => `<li><time>${fmtDate(e.t, false)}</time>${esc(KIND_LABEL[e.kind] || e.kind)} — ${esc(e.what || "")}</li>`).join("")}</ul>`;
+  const body = $("#dbody"), top = body.scrollTop;
+  body.innerHTML = html;
+  body.scrollTop = top;
+  const q = $("#dq");
+  if (q) q.oninput = debounce(e => { PANEL.q = e.target.value; panelBody(r); const n = $("#dq"); n.focus(); n.setSelectionRange(n.value.length, n.value.length); }, 120);
+  const md = $("#dm-date"), mt = $("#dm-tier"), all = $("#dall");
+  if (md) md.onclick = () => { PANEL.mode = "date"; panelBody(r); };
+  if (mt) mt.onclick = () => { PANEL.mode = "tier"; panelBody(r); };
+  if (all) all.onclick = () => { PANEL.all = true; panelBody(r); };
+}
+$("#dclose").onclick = closePanel;
+$("#dbg").onclick = closePanel;
+document.addEventListener("click", e => {
+  const b = e.target.closest("[data-open]");
+  if (b) { e.preventDefault(); openPanel(b.dataset.open); return; }
+  if (e.target.closest("a, button, summary, input, select, label")) return;
+  const c = e.target.closest("#view [data-id]");
+  if (c) openPanel(c.dataset.id);
+});
+
 /* ---------- routing ---------- */
 function applyParams(view, qs){
   const st = UI[view], def = DEFAULTS[view];
@@ -725,19 +914,32 @@ function applyParams(view, qs){
   }
   save();
 }
-function fromHash(){ const [v, qs] = location.hash.slice(1).split("?"); applyParams(v, qs); return v; }
+let PENDING_OPEN = null;
+function fromHash(){
+  const [v, qs] = location.hash.slice(1).split("?");
+  applyParams(v, qs);
+  PENDING_OPEN = new URLSearchParams(qs || "").get("open");
+  return v;
+}
 const RENDER = {programs: viewPrograms, targets: viewTargets, activity: viewActivity, contests: viewContests, sources: viewSources};
 let current = "programs";
 function go(view, push){
   current = RENDER[view] ? view : "programs";
-  if (push !== false && location.hash.slice(1).split("?")[0] !== current) history.replaceState(null, "", "#" + current);
+  if (push !== false && location.hash.slice(1).split("?")[0] !== current) history.replaceState(null, "", "#" + current + (PANEL.id ? "?open=" + encodeURIComponent(PANEL.id) : ""));
   renderTabs(current);
   RENDER[current]();
 }
 function renderAll(){ now = Date.now() / 1000; renderLive(); renderStats(); go(current, false); }
-addEventListener("hashchange", () => go(fromHash(), false));
+addEventListener("hashchange", () => {
+  const v = fromHash();
+  if (PENDING_OPEN) { if (PENDING_OPEN !== PANEL.id) openPanel(PENDING_OPEN); }
+  else closePanel();
+  if (v !== current) go(v, false);
+});
 addEventListener("keydown", e => {
-  if (e.key === "/" && !/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)) {
+  if (e.key === "Escape" && PANEL.id) { closePanel(); return; }
+  if (e.key === "Enter" && document.activeElement && document.activeElement.matches("#view .card[data-id]")) { openPanel(document.activeElement.dataset.id); return; }
+  if (e.key === "/" && !PANEL.id && !/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)) {
     const s = $("#view input[type=search]"); if (s) { e.preventDefault(); s.focus(); s.select(); }
   }
 });
@@ -754,12 +956,14 @@ addEventListener("keydown", e => {
     return;
   }
   renderAll();
+  if (PENDING_OPEN) openPanel(PENDING_OPEN);
   // keep it live: check for a new sync every 2 minutes, re-render in place when there is one
   setInterval(async () => {
     try {
       const focused = document.activeElement && document.activeElement.matches("#view input[type=search]");
       if (await load(false)) {
         if (focused) { renderLive(); renderStats(); renderTabs(current); } else renderAll();
+        if (PANEL.id) openPanel(PANEL.id, true);
         toast("Updated with the latest sync");
       } else { now = Date.now() / 1000; renderLive(); }
     } catch (e) {}
