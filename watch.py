@@ -692,8 +692,13 @@ class Immunefi(Source):
     every = 30
     URL = "https://immunefi.com/public-api/bounties.json"
 
+    # Bump when the records gain fields: a 304 would otherwise keep serving the old shape until
+    # Immunefi happens to change its feed, so the ETag only counts for records of the current shape.
+    SCHEMA = 2
+
     def listing(self, prev, book):
-        hdrs = {"If-None-Match": book["etag"]} if prev and book.get("etag") else {}
+        fresh_shape = book.get("schema") == self.SCHEMA
+        hdrs = {"If-None-Match": book["etag"]} if prev and book.get("etag") and fresh_shape else {}
         status, body, h = fetch(self.URL, headers=hdrs, timeout=90)
         if status == 304:
             return {k: dict(v) for k, v in prev.items()}
@@ -722,7 +727,7 @@ class Immunefi(Source):
                                 mx > 0, money(mx) if mx else None, sig=b.get("updatedDate"), assets=assets,
                                 tags=tags, listed=b.get("launchDate"), updated=b.get("updatedDate"),
                                 added=added or None, tier=tiers, rtab=rtab)
-        book["etag"] = h.get("ETag")
+        book["etag"], book["schema"] = h.get("ETag"), self.SCHEMA
         return out
 
 
