@@ -867,7 +867,9 @@ function panelBody(r){
       const groups = new Map();
       for (const x of list) { const k = x[6] || "Other"; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(x); }
       let n = 0;
-      for (const [t, xs] of [...groups].sort((a, b) => tierRank(a[0]) - tierRank(b[0]) || b[1].length - a[1].length)) {
+      // named tiers in their order, otherwise the better-paying group first
+      const top = t => { const rr = rtRow.get(t), c = rr && rr.slice(1, 5).find(Boolean); return c ? +c.split(" – ").pop().replace(/[^0-9.]/g, "") || 0 : 0; };
+      for (const [t, xs] of [...groups].sort((a, b) => tierRank(a[0]) - tierRank(b[0]) || top(b[0]) - top(a[0]) || b[1].length - a[1].length)) {
         if (n >= cap) break;
         const rr = rtRow.get(t), top = rr && rr.slice(1, 5).find(Boolean);
         html += `<div class="tier-h">${esc(tierText(t) || t)}<span class="c">${xs.length}</span>${top ? `<span class="rw">up to ${esc(top.split(" – ").pop())}</span>` : ""}</div>`;
