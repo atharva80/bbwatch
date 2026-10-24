@@ -1,0 +1,102 @@
+{
+  "updated": "2026-10-24T22:15:35Z",
+  "sources": {
+    "bugbase": {
+      "programs": 26,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880043
+    },
+    "bugcrowd": {
+      "programs": 298,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880104
+    },
+    "bugrap": {
+      "programs": 51,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880042
+    },
+    "cantina": {
+      "programs": 220,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880100
+    },
+    "code4rena": {
+      "programs": 475,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880041
+    },
+    "codehawks": {
+      "programs": 104,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880099
+    },
+    "h1": {
+      "programs": 753,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880135
+    },
+    "hackenproof": {
+      "programs": 431,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880104
+    },
+    "huntr": {
+      "programs": 4,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880041
+    },
+    "immunefi": {
+      "programs": 227,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880129
+    },
+    "intigriti": {
+      "programs": 192,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880106
+    },
+    "issuehunt": {
+      "programs": 27,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880041
+    },
+    "mirror": {
+      "programs": 0,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880040
+    },
+    "sherlock": {
+      "programs": 339,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880102
+    },
+    "standoff": {
+      "programs": 226,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792879981
+    },
+    "ywh": {
+      "programs": 56,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1792880116
+    }
+  },
+  "outbox": 0
+}
