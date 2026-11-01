@@ -32,8 +32,10 @@ PORT=3000
 DRY_RUN=1
 #NTFY_TOPIC=
 #HEALTHCHECK_URL=
-# Back the state up to GitHub's state branch at most this often (seconds); needs push access.
-#BACKUP_EVERY=3600
+# Back the state up to GitHub at most this often (s). Only on the one live watcher, with push access: a
+# second box would overwrite the shared state branch. The page falls back to it when
+# the box is slow to reach, so keep it fresh: ~3 MB a push, 10 min = ~13 GB of the 100 GB monthly egress.
+#BACKUP_EVERY=600
 ENV
   chmod 600 "$env"
 fi

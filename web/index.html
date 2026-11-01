@@ -281,8 +281,10 @@ const BOX = "https://3000-agqzohdykvaneheahebwrkmwhm.instabox.tech/";
 const LOCAL = new URLSearchParams(location.search).has("local");  // ?local: preview a local build, skip the live feed
 // Where the data comes from, first answer wins: on GitHub Pages the box, then the state branch, then the
 // snapshot deployed with the page; served by the box itself, its own /data/ is the live feed.
+// The kind says how fresh: live (the watcher itself), backup (the box's copy on GitHub, minutes old),
+// snapshot (deployed with the page).
 const SOURCES = LOCAL ? [["data/", "snapshot"]]
-  : location.hostname.endsWith("github.io") ? [...(BOX ? [[BOX + "data/", "live"]] : []), [RAW, "live"], ["data/", "snapshot"]]
+  : location.hostname.endsWith("github.io") ? [...(BOX ? [[BOX + "data/", "live"]] : []), [RAW, BOX ? "backup" : "live"], ["data/", "snapshot"]]
   : [["data/", "live"]];
 const NSHARD = 32;
 const LIVE_STATES = new Set(["open", "active", "live"]);
@@ -424,8 +426,8 @@ function getJSON(name, bust){
       ctls.push(ctl);
       const kill = setTimeout(() => ctl.abort(), TIMEOUT);
       if (i + 1 < SOURCES.length) timers.push(setTimeout(() => start(i + 1), HEDGE));
-      fetch(base + name + (from === "live" ? "?v=" + encodeURIComponent(bust) : ""),
-            {signal: ctl.signal, cache: from === "live" ? "no-store" : "default"})
+      fetch(base + name + (from !== "snapshot" ? "?v=" + encodeURIComponent(bust) : ""),
+            {signal: ctl.signal, cache: from !== "snapshot" ? "no-store" : "default"})
         .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
         .then(j => finish([j, from]))
         .catch(() => { start(i + 1); })
@@ -458,8 +460,9 @@ async function load(initial){
   const bust = status.updated || Date.now();
   const [[catalog, cfrom], [latest], [changes]] = await Promise.all(["catalog.json", "latest.json", "changes.json"].map(n => getJSON(n, bust)));
   if (!catalog) { NET = "failed"; return false; }
+  // the label follows the catalog, the bulk of what is shown, not the tiny status file
   D = {status, catalog, latest: latest || D.latest, changes: changes || D.changes,
-       from: cfrom === "snapshot" ? "snapshot" : from, labels: catalog.labels || D.labels || {}};
+       from: cfrom, labels: catalog.labels || D.labels || {}};
   NET = "ok";
   index();
   [["status.json", status], ["catalog.json", catalog], ["latest.json", D.latest], ["changes.json", D.changes]]
@@ -492,7 +495,7 @@ function index(){
 /* ---------- header: live status, stats, tabs ---------- */
 function renderLive(){
   const el = $("#live"), txt = $("#live-text");
-  const u = D.status && Date.parse(D.status.updated) / 1000;
+  const u = (D.catalog && Date.parse(D.catalog.updated) / 1000) || (D.status && Date.parse(D.status.updated) / 1000);
   el.className = "live";
   if (!u) { el.classList.add("down"); txt.textContent = "No data"; return; }
   const age = now - u;
@@ -500,6 +503,12 @@ function renderLive(){
     el.classList.add(NET === "failed" ? "down" : "stale");
     txt.textContent = NET === "failed" ? `Offline · data from ${ago(u)}` : `Cached · refreshing…`;
     el.title = NET === "failed" ? "No source answered; showing what this browser last received." : "Showing what this browser last received while fetching the latest.";
+    return;
+  }
+  if (D.from === "backup") {
+    el.classList.add(age < 25 * 60 ? "ok" : "stale");
+    txt.textContent = `Synced ${ago(u)} · via GitHub`;
+    el.title = "The box was slow to answer, so this is its latest backup on GitHub; live data replaces it when the box responds.";
     return;
   }
   if (D.from === "snapshot") { el.classList.add("stale"); txt.textContent = `Snapshot · ${ago(u)}`; el.title = "The live feed was unreachable; showing the copy deployed with this page."; return; }
