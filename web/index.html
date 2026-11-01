@@ -453,7 +453,8 @@ async function loadCached(){
 async function load(initial){
   const [status, from] = await getJSON("status.json", Math.floor(Date.now() / 60000));
   if (!status) { NET = "failed"; return false; }
-  if (!initial && D.status && D.from !== "cache" && status.updated === D.status.updated) { NET = "ok"; return false; }
+  // nothing new — unless what's shown came from the cache or the snapshot, which live data should replace
+  if (!initial && D.status && D.from === "live" && status.updated === D.status.updated) { NET = "ok"; return false; }
   const bust = status.updated || Date.now();
   const [[catalog, cfrom], [latest], [changes]] = await Promise.all(["catalog.json", "latest.json", "changes.json"].map(n => getJSON(n, bust)));
   if (!catalog) { NET = "failed"; return false; }
@@ -1108,8 +1109,9 @@ addEventListener("keydown", e => {
     if (focused) { renderLive(); renderStats(); renderSince(); renderTabs(current); } else renderAll();
     if (PANEL.id) openPanel(PANEL.id, true);
   } else renderLive();
-  // keep it live: check for a new sync every 2 minutes, re-render in place when there is one
-  setInterval(async () => {
+  // keep it live: check for a new sync every 2 minutes (and soon after a first load that only reached the
+  // snapshot), re-render in place when there is one
+  const refresh = async () => {
     try {
       const focused = document.activeElement && document.activeElement.matches("#view input[type=search]");
       if (await load(false)) {
@@ -1118,7 +1120,9 @@ addEventListener("keydown", e => {
         toast("Updated with the latest sync");
       } else { now = Date.now() / 1000; renderLive(); }
     } catch (e) {}
-  }, 120000);
+  };
+  setInterval(refresh, 120000);
+  if (D.from !== "live") setTimeout(refresh, 10000);
 })();
 </script>
 </body>
