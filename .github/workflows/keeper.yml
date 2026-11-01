@@ -51,7 +51,28 @@ jobs:
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
         run: python3 watch.py --test
 
+      # With the repo variable WATCHER=box the watcher runs on its own box (deploy/box) and GitHub
+      # only watches it: the GitHub watcher steps below stand down and the box watchdog runs instead.
+      # `gh variable delete WATCHER` hands the job back to watch.yml.
+      - name: Box watchdog
+        if: ${{ vars.WATCHER == 'box' }}
+        env:
+          BOX_URL: ${{ vars.BOX_URL }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        # The first request also wakes a box that paused itself, so give it a few tries before alarming.
+        run: |
+          for i in 1 2 3 4; do
+            if out=$(curl -fsS -m 40 "$BOX_URL/healthz"); then echo "box healthy: $out"; exit 0; fi
+            echo "box not healthy yet (try $i): ${out:-no answer}"; sleep 45
+          done
+          msg="$BOX_URL/healthz has not answered OK for 3 minutes, so nothing is watching. Check: instabox get bbwatch"
+          for t in ${NTFY_TOPIC//,/ }; do
+            curl -fsS -m 20 -H "Title: ⚠️ bbwatch box is down" -H "Priority: 4" -H "Tags: warning" -d "$msg" "https://ntfy.sh/$t" >/dev/null || true
+          done
+          exit 1
+
       - name: Watchdog
+        if: ${{ vars.WATCHER != 'box' }}
         # A healthy watcher syncs status.json at least every ~10 min. This is
         # the independent half of the check: even if a wedged run fools
         # ensure-watcher.sh, a state file that has not moved for 30 min means
@@ -70,6 +91,7 @@ jobs:
           done
 
       - name: Ensure a watcher is running or queued
+        if: ${{ vars.WATCHER != 'box' }}
         run: bash .github/ensure-watcher.sh
 
       # The dashboard (web/index.html) loads its data live from the state

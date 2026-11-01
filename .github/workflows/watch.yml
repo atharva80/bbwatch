@@ -32,6 +32,9 @@ concurrency:
 
 jobs:
   watch:
+    # Stands down while the watcher runs on its own box (repo variable WATCHER=box), so a queued
+    # successor or a keeper dispatch can never start a second watcher next to it.
+    if: ${{ vars.WATCHER != 'box' }}
     runs-on: ubuntu-latest
     timeout-minutes: 355
     env:
