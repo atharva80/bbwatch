@@ -262,7 +262,14 @@ body.locked{overflow:hidden}
 <script>
 "use strict";
 const RAW = "https://raw.githubusercontent.com/atharva80/bbwatch/state/";
+// The box that runs the watcher and serves its data live; empty while the watcher runs on GitHub.
+const BOX = "";
 const LOCAL = new URLSearchParams(location.search).has("local");  // ?local: preview a local build, skip the live feed
+// Where the data comes from, first answer wins: on GitHub Pages the box, then the state branch, then the
+// snapshot deployed with the page; served by the box itself, its own /data/ is the live feed.
+const SOURCES = LOCAL ? [["data/", "snapshot"]]
+  : location.hostname.endsWith("github.io") ? [...(BOX ? [[BOX + "data/", "live"]] : []), [RAW, "live"], ["data/", "snapshot"]]
+  : [["data/", "live"]];
 const NSHARD = 32;
 const LIVE_STATES = new Set(["open", "active", "live"]);
 const DEAD_STATES = new Set(["ended", "closed", "suspended", "archived", "finished"]);
@@ -348,8 +355,8 @@ const shown = {programs: 60, targets: 40, activity: 60};
 
 /* ---------- data ---------- */
 async function getJSON(name, bust){
-  const tries = [[RAW + name + "?v=" + encodeURIComponent(bust), "live"], ["data/" + name, "snapshot"]].slice(LOCAL ? 1 : 0);
-  for (const [url, from] of tries){
+  for (const [base, from] of SOURCES){
+    const url = base + name + (from === "live" ? "?v=" + encodeURIComponent(bust) : "");
     try {
       const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 9000);
       const r = await fetch(url, {signal: ctl.signal, cache: from === "live" ? "no-store" : "default"});

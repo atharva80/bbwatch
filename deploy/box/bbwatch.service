@@ -1,0 +1,17 @@
+[Unit]
+Description=bbwatch: bug-bounty program and scope watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=@ENV@
+ExecStart=/usr/bin/python3 watch.py --loop
+Restart=always
+RestartSec=10
+# SIGTERM makes the watcher drain in-flight polls and save before exiting
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

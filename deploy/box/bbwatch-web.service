@@ -1,0 +1,14 @@
+[Unit]
+Description=bbwatch dashboard, data and /healthz
+After=network-online.target
+
+[Service]
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=@ENV@
+ExecStart=/usr/bin/python3 deploy/box/serve.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
