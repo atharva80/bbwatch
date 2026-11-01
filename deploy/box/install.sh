@@ -38,6 +38,12 @@ ENV
   chmod 600 "$env"
 fi
 
+# Prefer IPv4 for outgoing connections. Cloud boxes often share one IPv6 address across many tenants,
+# and ntfy.sh's anonymous quota is per address: on instabox the shared IPv6 one was exhausted daily (429)
+# while IPv4 had room.
+grep -qs '^precedence ::ffff:0:0/96  100' /etc/gai.conf ||
+  echo 'precedence ::ffff:0:0/96  100' | sudo tee -a /etc/gai.conf >/dev/null
+
 for unit in bbwatch bbwatch-web; do
   sed -e "s|@USER@|$USER|g" -e "s|@DIR@|$dir|g" -e "s|@ENV@|$env|g" "$dir/deploy/box/$unit.service" |
     sudo tee "/etc/systemd/system/$unit.service" >/dev/null
