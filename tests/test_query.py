@@ -49,4 +49,10 @@ check(r["result"]["structuredContent"]["total"] == 3 and not r["result"]["isErro
 r = mcp_server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "get_program", "arguments": {"bad": 1}}}, d)
 check(r["result"]["isError"], "bad arguments are a tool error, not a crash")
 check(mcp_server.handle({"jsonrpc": "2.0", "id": 4, "method": "nope"}, d)["error"]["code"] == -32601, "unknown method -> -32601")
+import dashboard as db
+for typ, ident, want in [("url", "https://basescan.org/address/0x00F8B85b10239476A2170f7F0D6A5449B8ca4771", "contract"),
+                         ("url", "https://suiscan.xyz/mainnet/object/0x45bae0425e", "contract"),
+                         ("website", "https://github.com/ref-finance/ref-contracts", "code"),
+                         ("url", "https://docs.etherscan.io/api", "web"), ("url", "*.example.com", "wildcard")]:
+    check(db.type_cat(typ, ident) == want, f"type_cat {ident[:40]} -> {want}")
 print("\nALL PASS" if not fails else f"\n{len(fails)} FAILED"); sys.exit(1 if fails else 0)

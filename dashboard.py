@@ -124,6 +124,14 @@ def usd(m):
     return int(val * rate) if rate else 0
 
 
+# A target listed as a plain URL can still be a contract or a repository: block-explorer address pages and
+# code-host links are classified by what they point at, not by the platform's generic "url" type.
+EXPLORER = re.compile(r"(?:^|[/.])(?:[a-z-]*scan\.(?:org|io|com|xyz|net)|explorer\.[a-z0-9.-]+|"
+                      r"blockscout\.[a-z0-9.-]+|snowtrace\.io|tronscan\.org)/(?:[a-z0-9-]+/)?(?:#/)?(?:address|token|contract|account|object|"
+                      r"package|tx)/", re.I)
+CODEHOST = re.compile(r"(?:^|//|\.)(?:github\.com|gitlab\.com|bitbucket\.org|codeberg\.org)/[^/\s]+/[^/\s]+", re.I)
+
+
 def type_cat(typ, ident=""):
     t = str(typ or "").strip().lower()
     if t in TYPE_CAT:
@@ -140,6 +148,10 @@ def type_cat(typ, ident=""):
         cat = "web"
     else:
         cat = "other"
+    if cat in ("web", "other", "wildcard") and EXPLORER.search(str(ident)):
+        return "contract"
+    if cat in ("web", "other") and CODEHOST.search(str(ident)):
+        return "code"
     if cat in ("web", "other") and str(ident).startswith("*."):
         return "wildcard"
     if cat == "other" and str(ident).startswith("0x"):

@@ -3,7 +3,8 @@
 
     /            web/index.html (it reads its data from /data/ when not on GitHub Pages)
     /data/NAME   the state files the dashboard reads: status, changes, catalog, latest, scope-NN
-    /healthz     200 while the watcher's state is fresh, 503 when it is not — what the wake pinger hits
+    /healthz     200 while the watcher's state is fresh and pushes are going out, 503 otherwise — what the
+                 wake pinger hits, so its failure emails cover a dead watcher and stuck notifications alike
     /api/…       the query engine (query.py) as JSON: programs, programs/<id>, targets, latest-targets,
                  changes, stats; GET /api lists the filters
     /mcp         the same as an MCP server (Streamable HTTP, JSON responses): mcp_server.py's tools
@@ -99,16 +100,24 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path in ("/", "/index.html"):
             return self.file(os.path.join(ROOT, "web", "index.html"), "text/html; charset=utf-8")
+        if path == "/sw.js":
+            return self.file(os.path.join(ROOT, "web", "sw.js"), "application/javascript")
         if path == "/healthz":
             try:
                 with open(os.path.join(STATE, "status.json")) as f:
-                    updated = json.load(f)["updated"]
+                    status = json.load(f)
+                updated = status["updated"]
                 age = time.time() - calendar.timegm(time.strptime(updated, "%Y-%m-%dT%H:%M:%SZ"))
             except Exception as e:
                 return self.send(503, json.dumps({"ok": False, "error": str(e)}).encode(), "application/json")
-            ok = age < STALE
-            return self.send(200 if ok else 503, json.dumps({"ok": ok, "updated": updated, "age_s": int(age)}).encode(),
-                             "application/json", {"Cache-Control": "no-store"})
+            stuck = time.time() - status["outbox_since"] if status.get("outbox_since") else 0
+            failing = sorted(k for k, s in (status.get("sources") or {}).items() if s.get("error"))
+            problems = ([f"state not saved for {int(age // 60)} min"] if age >= STALE else []) + \
+                       ([f"{status.get('outbox')} pushes stuck for {int(stuck // 60)} min"] if stuck >= STALE else [])
+            body = {"ok": not problems, "updated": updated, "age_s": int(age), "queued_pushes": status.get("outbox", 0),
+                    "failing_sources": failing, "problems": problems}
+            return self.send(200 if not problems else 503, json.dumps(body).encode(), "application/json",
+                             {"Cache-Control": "no-store"})
         m = DATA.fullmatch(path)
         if m:
             name = m.group(1)

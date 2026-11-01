@@ -1628,6 +1628,10 @@ def deliver(state, events):
                 log(f"ntfy publish failed: {e}")
         keep.append(m)
     state["outbox"] = keep[-100:]
+    if keep:  # since when pushes have been waiting: /healthz fails if that drags on
+        state.setdefault("outbox_since", int(time.time()))
+    else:
+        state.pop("outbox_since", None)
     record_changes(events)
     record_targets()
     return len(fresh)
@@ -1652,7 +1656,8 @@ def save_state(state):
     status = {"updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "sources": {
         name: {"programs": len(s["programs"]), "fails": s["book"].get("fails", 0), "error": s["book"].get("err"),
                "ok_at": s["book"].get("ok_at")}
-        for name, s in (state.get("sources") or {}).items()}, "outbox": len(state.get("outbox") or [])}
+        for name, s in (state.get("sources") or {}).items()}, "outbox": len(state.get("outbox") or []),
+        "outbox_since": state.get("outbox_since")}
     with open(STATUS_FILE + ".tmp", "w") as f:
         json.dump(status, f, indent=2)
         f.write("\n")

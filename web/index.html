@@ -222,6 +222,19 @@ footer a{color:var(--dim)}
 .tier-h .rw{margin-left:auto;font-size:12px;color:var(--good);font-weight:600}
 .note{font-size:12px;color:var(--faint);margin-top:14px}
 body.locked{overflow:hidden}
+/* stars, since-last-visit, copy */
+.star{border:0;background:none;cursor:pointer;font-size:15px;line-height:1;color:var(--faint);padding:0 2px;margin-left:4px}
+.star:hover{color:var(--warn)} .star[aria-pressed="true"]{color:#e3a008}
+.card.seen-new,.group.seen-new{box-shadow:inset 3px 0 0 var(--accent)}
+.since{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;margin:2px auto 0;font-size:13px;color:var(--dim)}
+.since b{color:var(--text)}
+.since button{border:0;background:none;color:var(--accent);cursor:pointer;padding:0;font:inherit}
+.since button:hover{text-decoration:underline}
+.d-actions{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 8px}
+.d-actions button{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:6px 10px;font-size:12.5px;cursor:pointer;color:var(--text)}
+.d-actions button:hover{border-color:var(--line-2)}
+.srow .cp{border:0;background:none;cursor:pointer;color:var(--faint);padding:0 2px;font-size:13px;opacity:.55;flex:none;margin-top:1px}
+.srow:hover .cp{opacity:1} .srow .cp:hover{color:var(--accent)}
 @media (max-width:640px){.brand small{display:none} .live span{display:none} .count{margin-left:0;width:100%}}
 </style>
 </head>
@@ -242,6 +255,7 @@ body.locked{overflow:hidden}
 </header>
 
 <div class="wrap stats" id="stats"></div>
+<div class="wrap since" id="since"></div>
 <main class="wrap" id="view" aria-live="polite"></main>
 
 <footer class="wrap">
@@ -332,7 +346,7 @@ function reward(r){
 
 /* ---------- persisted UI state ---------- */
 const DEFAULTS = {
-  programs: {q: "", plats: [], types: [], status: "live", bounty: true, contests: false, within: 0, reward: 0, rep: "", nofee: false, sort: "listed", view: "grid", more: false},
+  programs: {q: "", plats: [], types: [], status: "live", bounty: true, contests: false, within: 0, reward: 0, rep: "", nofee: false, starred: false, sort: "listed", view: "grid", more: false},
   targets: {q: "", plats: [], types: [], within: 7, paid: true, why: ["new", "added", "paid"]},
   activity: {q: "", plats: [], kinds: ["NEW", "SCOPE", "SCOPE-", "OPEN", "STATE", "BOUNTY", "GONE", "META"], within: 7},
   contests: {plats: []},
@@ -341,6 +355,46 @@ let UI = JSON.parse(JSON.stringify(DEFAULTS));
 try { const s = JSON.parse(localStorage.getItem("bbwatch.ui.v2") || "null"); if (s) for (const k in UI) Object.assign(UI[k], s[k] || {}); } catch (e) {}
 function save(){ try { localStorage.setItem("bbwatch.ui.v2", JSON.stringify(UI)); } catch (e) {} }
 const shown = {programs: 60, targets: 40, activity: 60};
+
+/* ---------- stars and "since your last visit" (this browser only) ---------- */
+let STARS = new Set();
+try { STARS = new Set(JSON.parse(localStorage.getItem("bbwatch.stars") || "[]")); } catch (e) {}
+function toggleStar(id){
+  STARS.has(id) ? STARS.delete(id) : STARS.add(id);
+  try { localStorage.setItem("bbwatch.stars", JSON.stringify([...STARS])); } catch (e) {}
+  document.querySelectorAll(`[data-star="${CSS.escape(id)}"]`).forEach(b => b.setAttribute("aria-pressed", STARS.has(id)));
+  const chip = $("#pstarred");
+  if (chip) chip.textContent = `★ Starred${STARS.size ? ` · ${STARS.size}` : ""}`;
+  if (current === "programs" && UI.programs.starred) programResults();
+}
+function starBtn(id){ return `<button class="star" data-star="${esc(id)}" aria-pressed="${STARS.has(id)}" title="Star this program" aria-label="Star">★</button>`; }
+// The last time this browser had the page open: read once at load, written whenever the page is left.
+let PREV_VISIT = 0;
+try { PREV_VISIT = +localStorage.getItem("bbwatch.lastVisit") || 0; } catch (e) {}
+function markVisit(){ try { localStorage.setItem("bbwatch.lastVisit", String(Math.floor(Date.now() / 1000))); } catch (e) {} }
+addEventListener("pagehide", markVisit);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") markVisit(); });
+const sinceNew = t => PREV_VISIT && t > PREV_VISIT;
+function renderSince(){
+  const el = $("#since");
+  if (!PREV_VISIT || !PROG.length) { el.innerHTML = ""; return; }
+  const progs = PROG.filter(r => !r.c && r.b && (sinceNew(r.F) || (sinceNew(r.L) && r.L <= now))).length;
+  const grew = PROG.filter(r => r.b && sinceNew(r.S)).length;
+  const targets = LATEST.filter(e => sinceNew(e.t)).length;
+  const changes = CHANGES.filter(e => sinceNew(e.t) && e.kind !== "HEALTH" && e.kind !== "ARMED").length;
+  const days = Math.max(0.01, (now - PREV_VISIT) / DAY);
+  el.innerHTML = `<span>Since your last visit <b>${ago(PREV_VISIT)}</b>:</span>` + (progs + grew + targets + changes ? [
+    progs ? `<button data-go="programs" data-within="${days}"><b>${progs}</b> new paying program${progs === 1 ? "" : "s"}</button>` : "",
+    targets ? `<button data-go="targets" data-within="${days}"><b>${targets}</b> target${targets === 1 ? "" : "s"} added</button>` : "",
+    changes ? `<button data-go="activity" data-within="${days}"><b>${changes}</b> change${changes === 1 ? "" : "s"}</button>` : ""
+  ].filter(Boolean).join("") : `<span>nothing new</span>`);
+  el.querySelectorAll("[data-go]").forEach(b => b.onclick = () => {
+    const v = b.dataset.go;
+    UI[v].within = +b.dataset.within;
+    if (v === "programs") Object.assign(UI.programs, {status: "live", bounty: true, contests: false, sort: "listed", starred: false});
+    save(); go(v, true);
+  });
+}
 
 /* ---------- theme ---------- */
 (function(){
@@ -354,25 +408,61 @@ const shown = {programs: 60, targets: 40, activity: 60};
 })();
 
 /* ---------- data ---------- */
-async function getJSON(name, bust){
-  for (const [base, from] of SOURCES){
-    const url = base + name + (from === "live" ? "?v=" + encodeURIComponent(bust) : "");
-    try {
-      const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 9000);
-      const r = await fetch(url, {signal: ctl.signal, cache: from === "live" ? "no-store" : "default"});
-      clearTimeout(timer);
-      if (r.ok) return [await r.json(), from];
-    } catch (e) {}
-  }
-  return [null, "none"];
+// Ask the sources in order, but don't queue behind a slow one: each next source starts HEDGE ms later, or at
+// once when the previous one fails, and the first good answer wins (the others are cancelled). A hiccup
+// on the box-to-browser path then costs seconds, not one timeout per source.
+const HEDGE = 2500, TIMEOUT = 30000;
+function getJSON(name, bust){
+  return new Promise(resolve => {
+    let done = false, started = 0, settled = 0;
+    const ctls = [], timers = [];
+    const finish = v => { if (!done) { done = true; ctls.forEach(c => c.abort()); timers.forEach(clearTimeout); resolve(v); } };
+    const start = i => {
+      if (done || i >= SOURCES.length || i < started) return;
+      started = i + 1;
+      const [base, from] = SOURCES[i], ctl = new AbortController();
+      ctls.push(ctl);
+      const kill = setTimeout(() => ctl.abort(), TIMEOUT);
+      if (i + 1 < SOURCES.length) timers.push(setTimeout(() => start(i + 1), HEDGE));
+      fetch(base + name + (from === "live" ? "?v=" + encodeURIComponent(bust) : ""),
+            {signal: ctl.signal, cache: from === "live" ? "no-store" : "default"})
+        .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+        .then(j => finish([j, from]))
+        .catch(() => { start(i + 1); })
+        .finally(() => { clearTimeout(kill); if (++settled === SOURCES.length || (settled === started && started === SOURCES.length)) finish([null, "none"]); });
+    };
+    start(0);
+  });
+}
+// What the browser last received, so the page renders instantly and still works offline.
+const DATA_CACHE = "bbwatch-data-v1";
+async function cacheGet(name){
+  try { const r = await (await caches.open(DATA_CACHE)).match("cache/" + name); return r ? await r.json() : null; } catch (e) { return null; }
+}
+function cachePut(name, obj){
+  try { caches.open(DATA_CACHE).then(c => c.put("cache/" + name, new Response(JSON.stringify(obj)))).catch(() => {}); } catch (e) {}
+}
+let NET = "loading";  // loading | refreshing | ok | failed
+async function loadCached(){
+  const [status, catalog, latest, changes] = await Promise.all(["status.json", "catalog.json", "latest.json", "changes.json"].map(cacheGet));
+  if (!catalog || !status) return false;
+  D = {status, catalog, latest, changes, from: "cache", labels: catalog.labels || {}};
+  index();
+  return true;
 }
 async function load(initial){
   const [status, from] = await getJSON("status.json", Math.floor(Date.now() / 60000));
-  if (!initial && status && D.status && status.updated === D.status.updated) return false;
-  const bust = (status && status.updated) || Date.now();
-  const [[catalog], [latest], [changes]] = await Promise.all(["catalog.json", "latest.json", "changes.json"].map(n => getJSON(n, bust)));
-  D = {status, catalog, latest, changes, from, labels: (catalog && catalog.labels) || D.labels || {}};
+  if (!status) { NET = "failed"; return false; }
+  if (!initial && D.status && D.from !== "cache" && status.updated === D.status.updated) { NET = "ok"; return false; }
+  const bust = status.updated || Date.now();
+  const [[catalog, cfrom], [latest], [changes]] = await Promise.all(["catalog.json", "latest.json", "changes.json"].map(n => getJSON(n, bust)));
+  if (!catalog) { NET = "failed"; return false; }
+  D = {status, catalog, latest: latest || D.latest, changes: changes || D.changes,
+       from: cfrom === "snapshot" ? "snapshot" : from, labels: catalog.labels || D.labels || {}};
+  NET = "ok";
   index();
+  [["status.json", status], ["catalog.json", catalog], ["latest.json", D.latest], ["changes.json", D.changes]]
+    .forEach(([n, v]) => v && cachePut(n, v));
   return true;
 }
 function index(){
@@ -405,6 +495,12 @@ function renderLive(){
   el.className = "live";
   if (!u) { el.classList.add("down"); txt.textContent = "No data"; return; }
   const age = now - u;
+  if (D.from === "cache") {
+    el.classList.add(NET === "failed" ? "down" : "stale");
+    txt.textContent = NET === "failed" ? `Offline · data from ${ago(u)}` : `Cached · refreshing…`;
+    el.title = NET === "failed" ? "No source answered; showing what this browser last received." : "Showing what this browser last received while fetching the latest.";
+    return;
+  }
   if (D.from === "snapshot") { el.classList.add("stale"); txt.textContent = `Snapshot · ${ago(u)}`; el.title = "The live feed was unreachable; showing the copy deployed with this page."; return; }
   el.classList.add(age < 25 * 60 ? "ok" : "stale");
   txt.textContent = age < 25 * 60 ? `Live · synced ${ago(u)}` : `Last sync ${ago(u)}`;
@@ -465,6 +561,11 @@ function wireChips(root, name, st, key, onChange){
   };
 }
 function windowSelect(id, val, opts){
+  // a window that is none of the presets (set by "since your last visit") gets its own option
+  if (val && !opts.some(([v]) => +val === v)) {
+    const sinceVisit = PREV_VISIT && Math.abs(+val - (now - PREV_VISIT) / DAY) < 0.02;
+    opts = [[+val, sinceVisit ? "Since your last visit" : `Last ${(+val).toFixed(1)} days`], ...opts];
+  }
   return `<select id="${id}">` + opts.map(([v, l]) => `<option value="${v}"${+val === v ? " selected" : ""}>${l}</option>`).join("") + `</select>`;
 }
 function countBy(list, f){ const c = {}; for (const r of list) for (const k of [].concat(f(r))) c[k] = (c[k] || 0) + 1; return c; }
@@ -483,6 +584,7 @@ function progLink(r, url, name){
 function progFilter(st, skip){
   const ws = words(st.q), plats = new Set(st.plats), types = new Set(st.types), cut = st.within ? now - st.within * DAY : 0;
   const rep = st.rep === "" ? null : +st.rep;
+  if (st.starred) return PROG.filter(r => STARS.has(r.id) && (!ws.length || hit(r._h, ws)));
   return PROG.filter(r => {
     if (skip !== "plats" && plats.size && !plats.has(r.p)) return false;
     if (skip !== "types" && types.size && !r.ty.some(t => types.has(t))) return false;
@@ -518,6 +620,7 @@ function viewPrograms(){
         ${[["listed", "Newest listed"], ["updated", "Recently updated"], ["reward", "Highest reward"], ["targets", "Most targets"], ["name", "Name A–Z"]].map(([k, l]) => `<option value="${k}"${st.sort === k ? " selected" : ""}>${l}</option>`).join("")}
       </select>
       ${windowSelect("pwithin", st.within, [[0, "Listed: any time"], [1, "Listed: 24 hours"], [7, "Listed: 7 days"], [30, "Listed: 30 days"], [90, "Listed: 90 days"]])}
+      <button class="chip" id="pstarred" aria-pressed="${!!st.starred}" title="Only programs you starred">★ Starred${STARS.size ? ` · ${STARS.size}` : ""}</button>
       <button class="chip" id="pmore" aria-pressed="${st.more}">More filters${extra ? ` · ${extra}` : ""}</button>
       <div class="seg" role="group" aria-label="Layout">
         <button id="pgrid" class="${st.view === "grid" ? "on" : ""}" title="Cards"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="8" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/></svg></button>
@@ -541,6 +644,7 @@ function viewPrograms(){
   $("#psort").onchange = e => { st.sort = e.target.value; save(); shown.programs = 60; programResults(); };
   $("#pwithin").onchange = e => { st.within = +e.target.value; save(); rerender(); };
   $("#pmore").onclick = () => { st.more = !st.more; save(); viewPrograms(); };
+  $("#pstarred").onclick = () => { st.starred = !st.starred; save(); rerender(); };
   $("#pgrid").onclick = () => { st.view = "grid"; save(); viewPrograms(); };
   $("#plist").onclick = () => { st.view = "list"; save(); viewPrograms(); };
   $("#pstatus").onchange = e => { st.status = e.target.value; save(); rerender(); };
@@ -576,9 +680,10 @@ function programCard(r){
   if (r.m && r.m.resp) facts.push(`${r.m.resp}% response`);
   if (last) facts.push(`<span class="hot">${esc(KIND_LABEL[last.kind] || last.kind)} ${ago(last.t)}</span>`);
   const dateTitle = r.Lw ? "First seen by bbwatch (the platform publishes no listing date)" : "Listed on the platform";
-  return `<article class="card${DEAD_STATES.has(r.s) ? " dead" : ""}" data-id="${esc(r.id)}" tabindex="0" title="Open scope & details">
+  const fresh = sinceNew(r.F) || sinceNew(r.S);
+  return `<article class="card${DEAD_STATES.has(r.s) ? " dead" : ""}${fresh ? " seen-new" : ""}" data-id="${esc(r.id)}" tabindex="0" title="${fresh ? "New since your last visit · " : ""}Open scope & details">
     <div class="c-top">${platChip(r.p)}${isNew(r) ? `<span class="badge-new">NEW</span>` : ""}<span class="st ${esc(r.s)}">${esc(r.s)}</span>
-      ${r.L ? `<span class="c-date" title="${dateTitle}">${r.Lw ? "seen " : ""}${fmtDate(r.L)}</span>` : ""}</div>
+      ${r.L ? `<span class="c-date" title="${dateTitle}">${r.Lw ? "seen " : ""}${fmtDate(r.L)}</span>` : ""}${starBtn(r.id)}</div>
     <h3>${esc(r.n)}</h3>
     ${rw ? `<div class="reward">${rw}</div>` : `<div class="reward none">${r.b ? "Bounty · amount not published" : "No bounty (VDP)"}</div>`}
     ${r.ty.length ? `<div class="tags">${r.ty.map(typeChip).join("")}</div>` : ""}
@@ -651,7 +756,7 @@ function targetResults(){
   for (const g of groups.slice(0, shown.targets)){
     if (g.day !== lastDay) { html += `<div class="day">${esc(g.day)}</div>`; lastDay = g.day; }
     const e = g.e, cap = 6;
-    html += `<div class="group">
+    html += `<div class="group${sinceNew(g.t) ? " seen-new" : ""}">
       <div class="g-head"><span class="why ${esc(e.w)}">${esc(WHY_LABEL[e.w] || e.w)}</span>${platChip(e.p)}
         <span class="name">${progLink(BY_ID.get(e.id), e.u, e.n)}</span>
         ${e.mx ? `<span class="st">up to ${esc(e.mx)}</span>` : ""}
@@ -709,7 +814,7 @@ function activityResults(){
     const day = dayLabel(e.t);
     if (day !== lastDay) { html += `<div class="day">${esc(day)}</div>`; lastDay = day; }
     const health = e.kind === "HEALTH" || e.kind === "ARMED";
-    html += `<div class="group">
+    html += `<div class="group${sinceNew(e.t) ? " seen-new" : ""}">
       <div class="g-head"><span class="kind k-${esc(e.kind)}">${esc(KIND_LABEL[e.kind] || e.kind)}</span>${D.labels[e.tag] ? platChip(e.tag) : ""}
         <span class="name">${health ? esc(e.title) : progLink(PROG_BY_URL.get(e.url), e.url, e.name)}</span>
         ${!health && e.what ? `<span class="what">${esc(e.what)}</span>` : ""}
@@ -783,7 +888,12 @@ const PLAIN_TYPES = new Set(["url", "website", "web", "domain", "wildcard", "api
 async function getShard(sh){
   if (!SHARDS.has(sh)) {
     const bust = (D.status && D.status.updated) || Date.now();
-    SHARDS.set(sh, getJSON(`scope-${String(sh).padStart(2, "0")}.json`, bust).then(([d]) => (d && d.programs) || null));
+    const name = `scope-${String(sh).padStart(2, "0")}.json`;
+    SHARDS.set(sh, getJSON(name, bust).then(async ([d]) => {
+      if (d) { cachePut(name, d); return d.programs || null; }
+      const c = await cacheGet(name);
+      return (c && c.programs) || null;
+    }));
   }
   return SHARDS.get(sh);
 }
@@ -817,7 +927,7 @@ function panelHead(r){
   const facts = [r.L ? `${r.Lw ? "first seen" : "listed"} ${fmtDate(r.L)}` : "", r.U && r.U !== r.L ? `updated ${ago(r.U)}` : "",
     r.m && r.m.reports ? `${r.m.reports.toLocaleString()} reports` : "", r.m && r.m.resp ? `${r.m.resp}% response efficiency` : "",
     r.c && r.w ? esc(r.w) : ""].filter(Boolean);
-  $("#dhead").innerHTML = `<div class="c-top">${platChip(r.p)}${isNew(r) ? `<span class="badge-new">NEW</span>` : ""}<span class="st ${esc(r.s)}">${esc(r.s)}</span></div>
+  $("#dhead").innerHTML = `<div class="c-top">${platChip(r.p)}${isNew(r) ? `<span class="badge-new">NEW</span>` : ""}<span class="st ${esc(r.s)}">${esc(r.s)}</span>${starBtn(r.id)}</div>
     <h2 id="d-title">${esc(r.n)}</h2>
     ${rw ? `<div class="reward">${rw}</div>` : `<div class="reward none">${r.b ? "Bounty · amount not published" : "No bounty (VDP)"}</div>`}
     ${facts.length ? `<div class="facts">${facts.map(f => `<span>${f}</span>`).join("")}</div>` : ""}
@@ -849,7 +959,7 @@ function panelBody(r){
     const id = safeUrl(x[0]) ? `<a href="${esc(x[0])}" target="_blank" rel="noopener">${esc(x[0])}</a>` : esc(x[0]);
     const when = x[7] ? `<time title="${x[8] === "s" ? "when bbwatch saw it added" : x[8] === "u" ? "last updated on the platform" : "added on the platform"} · ${new Date(x[7] * 1000).toLocaleString()}">${x[8] === "u" ? "updated" : x[8] === "a" ? "added" : "seen"} ${ago(x[7])}</time>` : "";
     return `<div class="srow">${typeChip(x[1])}<div class="main"><div class="id">${id}</div>
-      <div class="meta">${x[3] ? (x[4] ? `<span class="pd">bounty</span>` : `<span class="np">no bounty</span>`) : ""}${x[6] && !byTier && !(x[3] && oneTier) ? `<span class="t">${esc(tierText(x[6]))}</span>` : ""}${x[2] && !PLAIN_TYPES.has(x[2]) && x[2] !== x[1] ? `<span class="np">${esc(x[2].replace(/_/g, " "))}</span>` : ""}</div></div>${when}</div>`;
+      <div class="meta">${x[3] ? (x[4] ? `<span class="pd">bounty</span>` : `<span class="np">no bounty</span>`) : ""}${x[6] && !byTier && !(x[3] && oneTier) ? `<span class="t">${esc(tierText(x[6]))}</span>` : ""}${x[2] && !PLAIN_TYPES.has(x[2]) && x[2] !== x[1] ? `<span class="np">${esc(x[2].replace(/_/g, " "))}</span>` : ""}</div></div>${when}<button class="cp" data-copy="${esc(x[0])}" title="Copy" aria-label="Copy target">⧉</button></div>`;
   };
   let html = "";
   // reward table: only the severity columns that have an amount somewhere
@@ -868,6 +978,8 @@ function panelBody(r){
         ${tiers.length > 1 ? `<div class="seg" role="group" aria-label="Order"><button id="dm-date" class="${byTier ? "" : "on"}">Latest updated</button><button id="dm-tier" class="${byTier ? "on" : ""}">By ${tk === "Tier" ? "tier" : esc(tk.toLowerCase())}</button></div>` : ""}</div>`;
     }
     const list = inScope.filter(match);
+    html += `<div class="d-actions"><button data-act="copy">Copy ${list.length} in-scope target${list.length === 1 ? "" : "s"}</button>
+      <button data-act="txt">Download .txt</button><button data-act="json">Copy as JSON</button></div>`;
     const cap = PANEL.all ? Infinity : 150;
     if (!list.length) html += `<div class="note">No target matches “${esc(PANEL.q)}”.</div>`;
     else if (byTier) {
@@ -896,6 +1008,19 @@ function panelBody(r){
   body.scrollTop = top;
   const q = $("#dq");
   if (q) q.oninput = debounce(e => { PANEL.q = e.target.value; panelBody(r); const n = $("#dq"); n.focus(); n.setSelectionRange(n.value.length, n.value.length); }, 120);
+  const visible = inScope.filter(match);
+  body.querySelectorAll("[data-act]").forEach(b => b.onclick = () => {
+    const act = b.dataset.act;
+    if (act === "copy") copyText(visible.map(x => x[0]).join("\n"), `${visible.length} targets copied`);
+    else if (act === "json") copyText(JSON.stringify(visible.map(x => ({target: x[0], category: x[1], type: x[2], bounty_eligible: !!x[4],
+      severity: x[5] || null, tier: x[6] || null, date: x[7] ? new Date(x[7] * 1000).toISOString() : null})), null, 2), "Scope copied as JSON");
+    else {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([visible.map(x => x[0]).join("\n") + "\n"], {type: "text/plain"}));
+      a.download = `${r.id.replace(/[^a-z0-9_-]+/gi, "-")}-scope.txt`;
+      a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    }
+  });
   const md = $("#dm-date"), mt = $("#dm-tier"), all = $("#dall");
   if (md) md.onclick = () => { PANEL.mode = "date"; panelBody(r); };
   if (mt) mt.onclick = () => { PANEL.mode = "tier"; panelBody(r); };
@@ -903,7 +1028,16 @@ function panelBody(r){
 }
 $("#dclose").onclick = closePanel;
 $("#dbg").onclick = closePanel;
+async function copyText(text, msg){
+  try { await navigator.clipboard.writeText(text); }
+  catch (e) { const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); }
+  toast(msg || "Copied");
+}
 document.addEventListener("click", e => {
+  const star = e.target.closest("[data-star]");
+  if (star) { e.preventDefault(); e.stopPropagation(); toggleStar(star.dataset.star); return; }
+  const cp = e.target.closest("[data-copy]");
+  if (cp) { e.preventDefault(); copyText(cp.dataset.copy, "Target copied"); return; }
   const b = e.target.closest("[data-open]");
   if (b) { e.preventDefault(); openPanel(b.dataset.open); return; }
   if (e.target.closest("a, button, summary, input, select, label")) return;
@@ -938,7 +1072,7 @@ function go(view, push){
   renderTabs(current);
   RENDER[current]();
 }
-function renderAll(){ now = Date.now() / 1000; renderLive(); renderStats(); go(current, false); }
+function renderAll(){ now = Date.now() / 1000; renderLive(); renderStats(); renderSince(); go(current, false); }
 addEventListener("hashchange", () => {
   const v = fromHash();
   if (PENDING_OPEN) { if (PENDING_OPEN !== PANEL.id) openPanel(PENDING_OPEN); }
@@ -958,20 +1092,28 @@ addEventListener("keydown", e => {
   current = RENDER[v0] ? v0 : "programs";
   renderTabs(current);
   $("#view").innerHTML = `<div class="toolbar"></div><div class="grid">${'<div class="skel"></div>'.repeat(6)}</div>`;
-  await load(true);
+  if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
+  // what this browser last received renders at once; the network then replaces it in place
+  const cached = await loadCached();
+  if (cached) { NET = "refreshing"; renderAll(); if (PENDING_OPEN) openPanel(PENDING_OPEN); }
+  const fresh = await load(true);
   if (!D.catalog) {
     renderLive();
-    $("#view").innerHTML = emptyBox("Could not load the data", "Neither the live feed nor the deployed snapshot answered. Check your connection and reload.");
+    $("#view").innerHTML = emptyBox("Could not load the data", "No source answered and this browser has nothing saved yet. Check your connection and reload.");
     return;
   }
-  renderAll();
-  if (PENDING_OPEN) openPanel(PENDING_OPEN);
+  if (!cached) { renderAll(); if (PENDING_OPEN) openPanel(PENDING_OPEN); }
+  else if (fresh) {
+    const focused = document.activeElement && document.activeElement.matches("#view input[type=search]");
+    if (focused) { renderLive(); renderStats(); renderSince(); renderTabs(current); } else renderAll();
+    if (PANEL.id) openPanel(PANEL.id, true);
+  } else renderLive();
   // keep it live: check for a new sync every 2 minutes, re-render in place when there is one
   setInterval(async () => {
     try {
       const focused = document.activeElement && document.activeElement.matches("#view input[type=search]");
       if (await load(false)) {
-        if (focused) { renderLive(); renderStats(); renderTabs(current); } else renderAll();
+        if (focused) { renderLive(); renderStats(); renderSince(); renderTabs(current); } else renderAll();
         if (PANEL.id) openPanel(PANEL.id, true);
         toast("Updated with the latest sync");
       } else { now = Date.now() / 1000; renderLive(); }
