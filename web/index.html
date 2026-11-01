@@ -271,7 +271,7 @@ const TYPE_LABEL = {web: "web", wildcard: "wildcard", api: "api", mobile: "mobil
 const TYPE_HUE = {web: 212, wildcard: 190, api: 165, mobile: 285, contract: 32, code: 350, network: 140,
   desktop: 230, hardware: 15, ai: 320, other: 220};
 const KIND_LABEL = {NEW: "new program", SCOPE: "scope added", "SCOPE-": "scope reduced", OPEN: "reopened",
-  STATE: "status", BOUNTY: "bounty", GONE: "delisted", HEALTH: "watcher", ARMED: "watcher"};
+  STATE: "status", BOUNTY: "bounty", GONE: "delisted", META: "renamed", HEALTH: "watcher", ARMED: "watcher"};
 const WHY_LABEL = {new: "new program", added: "added", paid: "now paid"};
 const DAY = 86400;
 const STALE_JUDGING = 90 * DAY;
@@ -327,7 +327,7 @@ function reward(r){
 const DEFAULTS = {
   programs: {q: "", plats: [], types: [], status: "live", bounty: true, contests: false, within: 0, reward: 0, rep: "", nofee: false, sort: "listed", view: "grid", more: false},
   targets: {q: "", plats: [], types: [], within: 7, paid: true, why: ["new", "added", "paid"]},
-  activity: {q: "", plats: [], kinds: ["NEW", "SCOPE", "SCOPE-", "OPEN", "STATE", "BOUNTY", "GONE"], within: 7},
+  activity: {q: "", plats: [], kinds: ["NEW", "SCOPE", "SCOPE-", "OPEN", "STATE", "BOUNTY", "GONE", "META"], within: 7},
   contests: {plats: []},
 };
 let UI = JSON.parse(JSON.stringify(DEFAULTS));
@@ -674,7 +674,7 @@ function viewActivity(){
   const st = UI.activity, v = $("#view");
   const platCounts = countBy(activityFilter(st, "plats").filter(e => D.labels[e.tag]), e => e.tag);
   const plats = Object.keys(platCounts).concat(st.plats.filter(p => !(p in platCounts))).sort((a, b) => (platCounts[b] || 0) - (platCounts[a] || 0));
-  const kinds = ["NEW", "SCOPE", "SCOPE-", "OPEN", "STATE", "BOUNTY", "GONE", "HEALTH"];
+  const kinds = ["NEW", "SCOPE", "SCOPE-", "OPEN", "STATE", "BOUNTY", "GONE", "META", "HEALTH"];
   const kc = countBy(activityFilter(Object.assign({}, st, {kinds}), null), e => e.kind === "ARMED" ? "HEALTH" : e.kind);
   v.innerHTML = `<div class="toolbar">
     <div class="row">

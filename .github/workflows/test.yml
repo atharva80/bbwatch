@@ -1,0 +1,21 @@
+name: test
+
+# The watcher's diff logic decides what reaches the phone; every change to it runs the
+# false-positive suite first. Offline: no network, a fake clock.
+on:
+  push:
+    branches: [main]
+    paths: ["watch.py", "dashboard.py", "tests/**", ".github/workflows/test.yml"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tests/test_watch.py
+      - run: python3 -m py_compile watch.py dashboard.py

@@ -45,7 +45,7 @@ Pushes, by priority:
 - 🆕 new program — **5** with bounties (buzzes), 3 VDP
 - 🔭 assets added to scope / asset became bounty-eligible — **4** on a paying program, 3 otherwise
 - 🟢 program re-opened, 💰 started paying / max bounty up — **4**
-- 🚦 paused/closed, ✂️ scope reduced, ⚠️ removed, bounty down — 2
+- 🚦 paused/closed (after holding 12 h), ✂️ scope reduced, ⚠️ delisted, bounty down, any VDP change — 2: dashboard only, not pushed (`MIN_PRIORITY=2` to push them too)
 - ⚠️ a source failing 5 polls in a row (and ✅ when it recovers) — 3
 
 More than 8 changes in one poll: the top 7 are pushed individually, the rest

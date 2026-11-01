@@ -80,9 +80,15 @@ TARGETS_KEEP = 5000
 TARGETS_PER_PROGRAM = 150  # a big launch logs its first N targets, not thousands
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 DRY_RUN = bool(os.environ.get("DRY_RUN"))
-MIN_PRIORITY = int(os.environ.get("MIN_PRIORITY", "2"))
+# 3: pushes are for new paying programs, scope that grew, reopenings and bounty raises. Pauses, scope
+# reductions, delistings and VDP changes (priority 2) still land in the dashboard's Activity feed.
+MIN_PRIORITY = int(os.environ.get("MIN_PRIORITY", "3"))
 
 GONE_AFTER = 3        # consecutive polls a program must be missing before it counts as removed
+GONE_MIN = 45 * 60    # ...and for at least this long: paginated listings drop programs for a poll or two
+TOMB_KEEP = 30 * 86400  # a delisted program is remembered this long, so its return is not "new"
+STATE_HOLD = 12 * 3600  # a program must stay paused/closed this long before that is announced
+ASSET_HOLD = 6 * 3600   # a target re-added within this long of its removal is not "new scope"
 FAIL_ALERT = 5        # consecutive failed polls before a source-health push
 MAX_PUSHES = 8        # individual pushes per poll; the rest collapse into one digest
 MAX_LINES = 12        # asset/detail lines per push
@@ -242,6 +248,18 @@ SEVERITIES = ("critical", "high", "medium", "low")
 TEST_LISTING = re.compile(r"^\s*\[?\s*test\b", re.I)
 
 
+PLACEHOLDER_HOST = re.compile(
+    r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^/@\s]*@)?(?:\*\.)?(?:localhost|[^/:\s]*\.(?:invalid|test|example|localhost|local|lab|"
+    r"internal|lan|home|corp))(?::\d+)?(?:[/?#]|$)", re.I)
+
+
+def placeholder_scope(assets):
+    """True when every in-scope target is a host nobody outside can reach (localhost, *.invalid, *.lab…):
+    platform fixtures and training sandboxes, not programs."""
+    ins = [k.partition("|")[2].strip() for k, v in (assets or {}).items() if v and v[0]]
+    return bool(ins) and all(PLACEHOLDER_HOST.match(i) for i in ins)
+
+
 def is_test_listing(*names):
     """Platforms sometimes publish their own QA fixtures ("[TEST-R2] …" on IssueHunt); they are not programs."""
     return any(TEST_LISTING.match(str(n or "")) for n in names)
@@ -305,7 +323,7 @@ class Source:
                     if f not in p and o.get(f):
                         p[f] = o[f]
         if self.detail is None:
-            return progs
+            return self.clean(progs)
         want = {k for k in self.take_force() if k in progs}
         for k, p in progs.items():
             o = prev.get(k)
@@ -340,7 +358,11 @@ class Source:
             list(ex.map(one, sorted(want)))
         if failed:
             log(f"{self.label}: {len(failed)}/{len(want)} scope fetches failed (e.g. {failed[0][:160]})")
-        return progs
+        return self.clean(progs)
+
+    def clean(self, progs):
+        """Drop fixture programs whose whole scope is unreachable placeholder hosts."""
+        return {k: p for k, p in progs.items() if not placeholder_scope(p.get("assets"))}
 
 
 def _b64(n):
@@ -1234,7 +1256,7 @@ def plural(n, word):
 
 def new_event(src, key, p):
     live = p["state"] in LIVE
-    prio = (5 if p["bounty"] else 3) if live else 2
+    prio = 5 if live and p["bounty"] else 2
     a = p.get("assets")
     if a is None:
         lines = ["Scope not published yet — open the program page."]
@@ -1244,7 +1266,7 @@ def new_event(src, key, p):
     return event(src, p, "NEW", prio, f"new {'contest' if p.get('contest') else 'program'}", lines, "🆕")
 
 
-def diff_program(src, key, o, p, now_iso=None, adds=None):
+def diff_program(src, key, o, p, now_iso=None, adds=None, removed=None):
     kinds, lines = [], []
     live = p["state"] in LIVE
     oa, pa = o.get("assets"), p.get("assets")
@@ -1252,9 +1274,13 @@ def diff_program(src, key, o, p, now_iso=None, adds=None):
     if oa is not None and pa is not None and oa != pa:
         fresh = sorted((k for k in pa if pa[k][0] and not (k in oa and oa[k][0])),
                        key=lambda k: (not paid(pa[k], p), k))
+        if removed is not None:  # back within ASSET_HOLD of being dropped: a flap, not new scope
+            fresh = [k for k in fresh if time.time() - removed.get(k, 0) > ASSET_HOLD]
         now_paid = sorted(k for k in pa if k in oa and pa[k][0] and oa[k][0] and paid(pa[k], p) and not paid(oa[k], o))
         sev = sorted(k for k in pa if k in oa and pa[k][0] and oa[k][0] and pa[k][2] != oa[k][2])
         gone = sorted(k for k in oa if oa[k][0] and not (k in pa and pa[k][0]))
+        if removed is not None:
+            removed.update((k, time.time()) for k in gone)
         if fresh or now_paid:
             if now_iso:
                 p["scope_changed"] = now_iso  # assets added/became eligible — the catalog's "new scope" date
@@ -1262,7 +1288,7 @@ def diff_program(src, key, o, p, now_iso=None, adds=None):
                 adds += [(k, "added") for k in fresh] + [(k, "paid") for k in now_paid]
             hot = any(paid(pa[k], p) for k in fresh + now_paid)
             what = plural(len(fresh), "new target") if fresh else plural(len(now_paid), "target") + " now paid"
-            kinds.append(((4 if hot else 3) if live else 2, "SCOPE", what, "🔭"))
+            kinds.append(((4 if hot else 3) if live and p["bounty"] else 2, "SCOPE", what, "🔭"))
         elif gone or sev:
             kinds.append((2, "SCOPE-", "scope changed" if sev else plural(len(gone), "target") + " removed", "✂️"))
         lines += [asset_line("➕", k, pa[k], p) for k in fresh]
@@ -1296,24 +1322,76 @@ def gone_event(src, p):
 
 # ---------- diffing ----------
 
+def public_scope(p):
+    """In-scope targets that identify a program (URLs, hosts, addresses), not generic labels like "Smart Contracts"."""
+    return {k for k, v in (p.get("assets") or {}).items()
+            if v and v[0] and any(c in k.partition("|")[2] for c in "./:")}
+
+
+def find_rename(p, candidates):
+    """The vanished program `p` most likely is under a new name: same platform, mostly the same targets."""
+    mine, best = public_scope(p), (0.0, None)
+    if not mine:
+        return None
+    for key, rec in candidates.items():
+        theirs = public_scope(rec)
+        if theirs:
+            j = len(mine & theirs) / len(mine | theirs)
+            if j >= 0.6 and j > best[0]:
+                best = (j, key)
+    return best[1]
+
+
 def diff_source(src, prev, new, book):
-    """-> (state to keep, events). Absent programs are carried for GONE_AFTER polls."""
+    """-> (state to keep, events).
+
+    Built to say nothing a hunter would call a false positive:
+    - a program must be missing GONE_AFTER polls and GONE_MIN seconds before it is "gone", and is then kept
+      as a tombstone for TOMB_KEEP; coming back restores it (same first-seen date, normal diff), never "new";
+    - a "new" program with the targets of one that just vanished is that program renamed;
+    - pausing/closing is announced only once it has held STATE_HOLD, so a reverted flap says nothing,
+      while reopening after an announced pause is said right away;
+    - a target dropped and re-added within ASSET_HOLD is not new scope.
+    """
     events, merged = [], dict(new)
-    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    missing = book.setdefault("missing", {})
+    now, now_iso = time.time(), datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    missing, since = book.setdefault("missing", {}), book.setdefault("missing_since", {})
+    tomb, pending = book.setdefault("tomb", {}), book.setdefault("pending_state", {})
+    removed_all = book.setdefault("removed", {})
+    for k in [k for k, t in tomb.items() if now - t.get("at", 0) > TOMB_KEEP]:
+        del tomb[k]
+    for k in [k for k, ts_ in removed_all.items() if now - max(ts_.values(), default=0) > ASSET_HOLD]:
+        del removed_all[k]
     for k in prev.keys() - new.keys():
         missing[k] = missing.get(k, 0) + 1
-        if missing[k] >= GONE_AFTER:
-            del missing[k]
+        since.setdefault(k, now)
+        if missing[k] >= GONE_AFTER and now - since[k] >= GONE_MIN:
+            del missing[k], since[k]
+            tomb[k] = {"rec": prev[k], "at": now}
             if not is_test_listing(prev[k].get("name")):  # a filtered-out fixture leaves silently
                 events.append(gone_event(src, prev[k]))
         else:
             merged[k] = prev[k]
     for k, p in new.items():
         missing.pop(k, None)
+        since.pop(k, None)
         o = prev.get(k)
+        renamed_from = None
+        if o is None and k in tomb:  # back after being delisted: the same program, not a new one
+            o = tomb.pop(k)["rec"]
+        if o is None:  # a new key holding a vanished program's targets is a rename
+            vanished = {mk: merged[mk] for mk in missing if mk in merged}
+            vanished.update((tk, t["rec"]) for tk, t in tomb.items())
+            old_key = find_rename(p, vanished)
+            if old_key:
+                o = vanished[old_key]
+                renamed_from = o.get("name")
+                tomb.pop(old_key, None)
+                if old_key in missing:
+                    missing.pop(old_key, None), since.pop(old_key, None), merged.pop(old_key, None)
         if o is None:
             p["first_seen"] = now_iso  # when bbwatch first saw it — the catalog's "added" date
+            p["ann"] = p["state"]
             events.append(new_event(src, k, p))
             note_targets(src, k, p, [(a, "new") for a, v in (p.get("assets") or {}).items() if v[0]], now_iso)
             continue
@@ -1323,8 +1401,31 @@ def diff_source(src, prev, new, book):
             p["scope_changed"] = o["scope_changed"]
         if p.get("assets") is None and o.get("assets") is not None:  # unknown scope never erases a known one
             p["assets"] = o["assets"]
+        # the state the hunter was last told about, and whether this poll's state is ready to be told
+        ann, base = o.get("ann", o["state"]), p["state"]
+        if p["state"] == ann:
+            pending.pop(k, None)
+        elif p["state"] in LIVE and ann not in LIVE:  # reopened after an announced pause: say it now
+            pending.pop(k, None)
+            base, ann = ann, p["state"]
+        else:
+            pend = pending.get(k)
+            if not pend or pend.get("to") != p["state"]:
+                pend = pending[k] = {"to": p["state"], "since": now}
+            if now - pend["since"] >= STATE_HOLD:
+                pending.pop(k, None)
+                base, ann = ann, p["state"]
+        p["ann"] = ann
         adds = []
-        e = diff_program(src, k, o, p, now_iso, adds)
+        rm = removed_all.get(k, {})
+        e = diff_program(src, k, dict(o, state=base), p, now_iso, adds, rm)
+        if rm:
+            removed_all[k] = rm
+        if renamed_from and renamed_from != p.get("name"):
+            ev = e or event(src, p, "META", 2, f"renamed from {renamed_from}", [], "✏️")
+            if e:
+                ev["body"] = f"✏️ Renamed from {renamed_from}\n" + ev["body"]
+            e = ev
         if e:
             events.append(e)
         note_targets(src, k, p, adds, now_iso)
