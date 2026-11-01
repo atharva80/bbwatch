@@ -5,7 +5,7 @@ name: test
 on:
   push:
     branches: [main]
-    paths: ["watch.py", "dashboard.py", "tests/**", ".github/workflows/test.yml"]
+    paths: ["watch.py", "dashboard.py", "query.py", "mcp_server.py", "deploy/**", "tests/**", ".github/workflows/test.yml"]
   pull_request:
 
 permissions:
@@ -18,4 +18,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 tests/test_watch.py
-      - run: python3 -m py_compile watch.py dashboard.py
+      - run: python3 tests/test_query.py
+      - run: python3 -m py_compile watch.py dashboard.py query.py mcp_server.py deploy/box/serve.py

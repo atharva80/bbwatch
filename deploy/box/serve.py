@@ -4,6 +4,9 @@
     /            web/index.html (it reads its data from /data/ when not on GitHub Pages)
     /data/NAME   the state files the dashboard reads: status, changes, catalog, latest, scope-NN
     /healthz     200 while the watcher's state is fresh, 503 when it is not — what the wake pinger hits
+    /api/…       the query engine (query.py) as JSON: programs, programs/<id>, targets, latest-targets,
+                 changes, stats; GET /api lists the filters
+    /mcp         the same as an MCP server (Streamable HTTP, JSON responses): mcp_server.py's tools
 
 JSON is gzipped and ETagged, because egress is the free plan's scarce resource and the catalog is the
 bulk of every page load. CORS is open so the GitHub Pages copy of the page can read live data here.
@@ -16,12 +19,39 @@ import re
 import time
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+import sys
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, ROOT)
+import mcp_server  # noqa: E402
+from query import Data  # noqa: E402
 STATE = os.environ.get("STATE_DIR") or os.path.join(ROOT, ".state")
 PORT = int(os.environ.get("PORT") or 3000)
-DATA = re.compile(r"/data/((?:status|changes|catalog|latest)\.json|scope-\d\d\.json)")
+DATA = re.compile(r"/data/((?:status|changes|catalog|latest|targets)\.json|scope-\d\d\.json|state\.json\.gz)")
+API = {"/api/programs": "search_programs", "/api/targets": "search_targets", "/api/latest-targets": "latest_targets",
+       "/api/changes": "recent_changes", "/api/stats": "stats"}
+BOOLS = {"bounty_only", "no_submission_fee", "include_out_of_scope", "in_scope"}
+_data = {"mtime": None, "data": None}
+
+
+def data():
+    """The query engine over the current state, rebuilt when the watcher saves a new one."""
+    st = os.stat(os.path.join(STATE, "state.json.gz")).st_mtime
+    if _data["mtime"] != st:
+        _data.update(mtime=st, data=Data.from_dir(STATE))
+    return _data["data"]
+
+
+def args_from(query):
+    """Query-string values to the engine's types: a,b lists stay strings; booleans and null are parsed."""
+    out = {}
+    for k, v in parse_qsl(query, keep_blank_values=False):
+        if k in BOOLS:
+            out[k] = None if v.lower() in ("null", "any", "both") else v.lower() in ("1", "true", "yes")
+        else:
+            out[k] = v
+    return out
 STALE = 30 * 60
 _gz = {}  # (path, mtime, size) -> gzipped bytes, so repeat loads don't recompress
 
@@ -81,10 +111,60 @@ class Handler(BaseHTTPRequestHandler):
                              "application/json", {"Cache-Control": "no-store"})
         m = DATA.fullmatch(path)
         if m:
-            return self.file(os.path.join(STATE, m.group(1)), "application/json")
+            name = m.group(1)
+            return self.file(os.path.join(STATE, name), "application/gzip" if name.endswith(".gz") else "application/json")
+        if path == "/api" or path == "/api/":
+            return self.json(200, {"endpoints": {
+                "/api/programs": "search programs", "/api/programs/<id>": "one program in full",
+                "/api/targets": "search targets across all programs", "/api/latest-targets": "recently added targets",
+                "/api/changes": "change log", "/api/stats": "coverage and health", "/mcp": "MCP (Streamable HTTP)"},
+                "filters": {t["name"]: sorted(t["inputSchema"]["properties"]) for t in mcp_server.TOOLS},
+                "lists": "comma-separated, e.g. platform=h1,immunefi&category=contract,code"})
+        if path.startswith("/api/programs/"):
+            return self.query("get_program", dict(args_from(urlsplit(self.path).query), id=unquote(path[len("/api/programs/"):])))
+        if path in API:
+            return self.query(API[path], args_from(urlsplit(self.path).query))
+        if path == "/mcp":
+            return self.send(405, b"POST JSON-RPC to /mcp\n", "text/plain", {"Allow": "POST"})
         return self.send(404, b"not found\n", "text/plain")
 
     do_HEAD = do_GET
+
+    def json(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        head = {"Cache-Control": "no-store"}
+        if len(body) > 1024 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            body, head["Content-Encoding"] = gzip.compress(body, 6), "gzip"
+        return self.send(code, body, "application/json", head)
+
+    def query(self, tool, args):
+        try:
+            out = mcp_server.call_tool(tool, args, data())
+        except TypeError as e:
+            return self.json(400, {"error": "invalid_arguments", "message": str(e)})
+        except Exception as e:
+            return self.json(500, {"error": type(e).__name__, "message": str(e)})
+        return self.json(404 if isinstance(out, dict) and out.get("error") == "not_found" else 200, out)
+
+    def do_OPTIONS(self):
+        self.send(204, b"", "text/plain", {"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                                            "Access-Control-Allow-Headers": "Content-Type, Mcp-Session-Id, MCP-Protocol-Version"})
+
+    def do_POST(self):
+        if urlsplit(self.path).path != "/mcp":
+            return self.send(404, b"not found\n", "text/plain")
+        try:
+            msg = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"null")
+        except ValueError:
+            return self.json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+        try:
+            d = data()
+        except Exception as e:
+            return self.json(503, {"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": f"no data: {e}"}})
+        out = [r for r in (mcp_server.handle(m, d) for m in msg) if r] if isinstance(msg, list) else mcp_server.handle(msg, d)
+        if not out:  # notifications only
+            return self.send(202, b"", "text/plain")
+        return self.json(200, out)
 
 
 if __name__ == "__main__":

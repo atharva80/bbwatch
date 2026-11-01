@@ -253,6 +253,11 @@ def build_catalog(state):
 
 # ---------- latest targets ----------
 
+def _placeholder(ident):
+    from watch import PLACEHOLDER_HOST  # the watcher's own rule for unreachable fixture hosts
+    return bool(PLACEHOLDER_HOST.match(str(ident or "").strip()))
+
+
 def build_latest(state, targets, catalog):
     """Recently added in-scope targets: the platform's own per-asset dates (H1, Immunefi) merged with the
     additions the watcher observed (every platform), one row per (program, asset), newest first."""
@@ -304,7 +309,8 @@ def build_latest(state, targets, catalog):
              "a": ident, "y": e.get("type") or "", "c": type_cat(e.get("type"), ident),
              "$": 1 if e.get("paid") else 0, "w": e.get("why") or "added", "mx": e.get("max") or ""})
 
-    out = sorted(rows.values(), key=lambda r: (-r["t"], r["n"].lower(), r["a"]))[:LATEST_KEEP]
+    out = sorted((r for r in rows.values() if not _placeholder(r["a"])),
+                 key=lambda r: (-r["t"], r["n"].lower(), r["a"]))[:LATEST_KEEP]
     return out
 
 
