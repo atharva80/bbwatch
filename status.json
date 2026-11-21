@@ -1,0 +1,103 @@
+{
+  "updated": "2026-11-21T17:04:49Z",
+  "sources": {
+    "bugbase": {
+      "programs": 26,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795280641
+    },
+    "bugcrowd": {
+      "programs": 296,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795280635
+    },
+    "bugrap": {
+      "programs": 51,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795280631
+    },
+    "cantina": {
+      "programs": 221,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795280638
+    },
+    "code4rena": {
+      "programs": 475,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795280630
+    },
+    "codehawks": {
+      "programs": 104,
+      "fails": 4040,
+      "error": "HTTPError: HTTP Error 429: Too Many Requests",
+      "ok_at": 1794823297
+    },
+    "h1": {
+      "programs": 752,
+      "fails": 4511,
+      "error": "TypeError: 'NoneType' object is not subscriptable",
+      "ok_at": 1794915167
+    },
+    "hackenproof": {
+      "programs": 435,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795280631
+    },
+    "huntr": {
+      "programs": 5,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795280316
+    },
+    "immunefi": {
+      "programs": 230,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795280689
+    },
+    "intigriti": {
+      "programs": 199,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795280668
+    },
+    "issuehunt": {
+      "programs": 26,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795280629
+    },
+    "mirror": {
+      "programs": 0,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795280630
+    },
+    "sherlock": {
+      "programs": 340,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795280631
+    },
+    "standoff": {
+      "programs": 230,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795280572
+    },
+    "ywh": {
+      "programs": 52,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795280646
+    }
+  },
+  "outbox": 0,
+  "outbox_since": null
+}
