@@ -1,0 +1,103 @@
+{
+  "updated": "2026-11-28T17:47:53Z",
+  "sources": {
+    "bugbase": {
+      "programs": 26,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795887987
+    },
+    "bugcrowd": {
+      "programs": 296,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795888052
+    },
+    "bugrap": {
+      "programs": 51,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795887986
+    },
+    "cantina": {
+      "programs": 223,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795888045
+    },
+    "code4rena": {
+      "programs": 475,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795887999
+    },
+    "codehawks": {
+      "programs": 104,
+      "fails": 7296,
+      "error": "HTTPError: HTTP Error 429: Too Many Requests",
+      "ok_at": 1794823297
+    },
+    "h1": {
+      "programs": 752,
+      "fails": 8849,
+      "error": "TypeError: 'NoneType' object is not subscriptable",
+      "ok_at": 1794915167
+    },
+    "hackenproof": {
+      "programs": 437,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795888017
+    },
+    "huntr": {
+      "programs": 5,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795888008
+    },
+    "immunefi": {
+      "programs": 231,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795888045
+    },
+    "intigriti": {
+      "programs": 198,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795888042
+    },
+    "issuehunt": {
+      "programs": 26,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795887985
+    },
+    "mirror": {
+      "programs": 0,
+      "fails": 1,
+      "error": "HTTPError: HTTP Error 403: rate limit exceeded",
+      "ok_at": 1795887669
+    },
+    "sherlock": {
+      "programs": 342,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795888047
+    },
+    "standoff": {
+      "programs": 231,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795888003
+    },
+    "ywh": {
+      "programs": 50,
+      "fails": 0,
+      "error": null,
+      "ok_at": 1795888049
+    }
+  },
+  "outbox": 0,
+  "outbox_since": null
+}
